@@ -49,7 +49,7 @@ defmodule RealinvoiceCloudWeb.CoreComponents do
       phx-click={JS.push("lv:clear-flash", value: %{key: @kind}) |> hide("##{@id}")}
       role="alert"
       class={[
-        "fixed top-4 right-4 z-50 w-80 sm:w-96 cursor-pointer",
+        "fixed bottom-4 right-4 z-50 w-80 sm:w-96 cursor-pointer",
         "rounded-md border bg-popover px-4 py-3 text-sm shadow-lg",
         @kind == :info && "text-popover-foreground",
         @kind == :error && "border-destructive/40 text-destructive"
@@ -63,6 +63,86 @@ defmodule RealinvoiceCloudWeb.CoreComponents do
       </p>
       <p class={["text-muted-foreground", @title && "mt-1"]}>{msg}</p>
       <p class="sr-only">{gettext("close")}</p>
+    </div>
+    """
+  end
+
+  @doc """
+  A centred icon + message block for screens that have nothing to show yet.
+
+  SaladUI has no empty-state component, so this is a plain flat block built from
+  the same tokens.
+
+  ## Examples
+
+      <.empty_state icon="hero-inbox" title="No data yet" message="Nothing here.">
+        Optional longer explanation.
+      </.empty_state>
+  """
+  attr :icon, :string, default: "hero-inbox"
+  attr :title, :string, required: true
+  attr :message, :string, required: true
+  slot :inner_block, doc: "optional supporting copy under the message"
+
+  def empty_state(assigns) do
+    ~H"""
+    <div class="flex flex-col items-center justify-center px-6 py-24 text-center">
+      <span class="mb-5 flex size-12 items-center justify-center rounded-full bg-muted text-muted-foreground">
+        <span class={[@icon, "size-6 bg-muted-foreground"]} />
+      </span>
+      <h2 class="text-base font-semibold">{@title}</h2>
+      <p class="mt-1.5 text-sm text-muted-foreground">{@message}</p>
+      <p :if={@inner_block != []} class="mt-4 max-w-md text-sm leading-relaxed text-muted-foreground">
+        {render_slot(@inner_block)}
+      </p>
+    </div>
+    """
+  end
+
+  @doc """
+  Label/value rows, hairline separated — the About/Account pane treatment.
+
+  ## Examples
+
+      <.detail_list>
+        <:row label="Email">admin@example.com</:row>
+        <:row label="Role">owner</:row>
+      </.detail_list>
+  """
+  attr :class, :any, default: nil
+
+  slot :row, doc: "one label/value pair" do
+    attr :label, :string, required: true
+  end
+
+  def detail_list(assigns) do
+    ~H"""
+    <dl class={["divide-y divide-border border-y border-border", @class]}>
+      <div
+        :for={row <- @row}
+        class="flex flex-col gap-1 py-3 sm:flex-row sm:items-baseline sm:gap-6"
+      >
+        <dt class="w-48 shrink-0 text-sm text-muted-foreground">{row.label}</dt>
+        <dd class="min-w-0 text-sm">{render_slot(row)}</dd>
+      </div>
+    </dl>
+    """
+  end
+
+  @doc """
+  A flat section heading: a small label above a hairline rule.
+  """
+  attr :title, :string, required: true
+  attr :description, :string, default: nil
+  attr :class, :any, default: nil
+
+  def section_heading(assigns) do
+    ~H"""
+    <div class={["mb-4", @class]}>
+      <h2 class="text-sm font-semibold uppercase tracking-wide text-muted-foreground">
+        {@title}
+      </h2>
+      <p :if={@description} class="mt-1 text-sm text-muted-foreground">{@description}</p>
     </div>
     """
   end

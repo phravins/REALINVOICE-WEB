@@ -2,7 +2,9 @@ defmodule RealinvoiceCloudWeb.ErrorJSONTest do
   use RealinvoiceCloudWeb.ConnCase, async: true
 
   test "renders 404" do
-    assert RealinvoiceCloudWeb.ErrorJSON.render("404.json", %{}) == %{errors: %{detail: "Not Found"}}
+    assert RealinvoiceCloudWeb.ErrorJSON.render("404.json", %{}) == %{
+             errors: %{detail: "Not Found"}
+           }
   end
 
   test "renders 500" do

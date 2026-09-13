@@ -1,11 +1,17 @@
 import Config
 
-# Configure your database
+# Configure your database.
+#
+# Defaults suit a stock local Postgres; override per machine with environment
+# variables rather than editing this file, so nobody's local credentials end up
+# in a commit. Production credentials come from DATABASE_URL in runtime.exs and
+# are never configured here.
 config :realinvoice_cloud, RealinvoiceCloud.Repo,
-  username: "postgres",
-  password: "postgres",
-  hostname: "localhost",
-  database: "realinvoice_cloud_dev",
+  username: System.get_env("PGUSER", "postgres"),
+  password: System.get_env("PGPASSWORD", "postgres"),
+  hostname: System.get_env("PGHOST", "localhost"),
+  port: String.to_integer(System.get_env("PGPORT", "5432")),
+  database: System.get_env("PGDATABASE", "realinvoice_cloud_dev"),
   stacktrace: true,
   show_sensitive_data_on_connection_error: true,
   pool_size: 10

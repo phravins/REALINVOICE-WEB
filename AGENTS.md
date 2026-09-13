@@ -1,5 +1,33 @@
 This is a web application written using the Phoenix web framework.
 
+## RealInvoice Cloud specifics
+
+This app deviates from the stock `phx.new` output in ways that override some of
+the generated Phoenix guidance below:
+
+- **The component library is [SaladUI](https://hexdocs.pm/salad_ui), not daisyUI
+  and not hand-rolled components.** daisyUI has been removed. `use SaladUI` is in
+  `html_helpers/0`, so `<.button>`, `<.input>`, `<.label>`, `<.form_item>`,
+  `<.card>`, `<.table>`, `<.dropdown_menu>`, `<.sidebar_*>` and the rest are
+  available in every template. Reach for a SaladUI component before writing one.
+- `core_components.ex` keeps only what SaladUI does not cover: `<.flash>`,
+  `<.empty_state>`, `<.detail_list>`, `<.section_heading>`, the `show/hide` JS
+  transitions and error translation. `<.icon>` and `<.input>` now come from
+  SaladUI.
+- **All colour comes from the design tokens** at the top of `assets/css/app.css`
+  (`bg-background`, `text-muted-foreground`, `border-border`, `bg-sidebar`, …).
+  Never hardcode a colour. The palette is the OSWORKS house palette shared with
+  the Office Console: rust accent on warm cream/charcoal neutrals, flat surfaces,
+  small radii. Both light and dark are defined; dark is a `.dark` class on
+  `<html>`, driven by the inline script in `root.html.heex`.
+- **Two layouts.** Signed-in screens use `<Layouts.app ... active={:section}
+  title="…">`; the login screens use `<Layouts.auth flash={@flash}>`.
+- **There is no public registration.** Accounts are provisioned by
+  `priv/repo/seeds.exs` via `Accounts.create_staff_user/1`. Do not add a
+  `/users/register` route.
+- Do not build the ingest API, sync logic, or Ecto schemas for invoices,
+  customers or items yet — those wait for the desktop app's sync worker.
+
 ## Project guidelines
 
 - Use `mix precommit` alias when you are done with all changes and fix any pending issues
@@ -30,7 +58,7 @@ custom classes must fully style the input
 
 - **Always use and maintain this import syntax** in the app.css file for projects generated with `phx.new`
 - **Never** use `@apply` when writing raw css
-- **Always** manually write your own tailwind-based components instead of using daisyUI for a unique, world-class design
+- This project uses SaladUI for components (see the RealInvoice Cloud specifics at the top); daisyUI is not installed
 - Out of the box **only the app.js and app.css bundles are supported**
   - You cannot reference an external vendor'd script `src` or link `href` in the layouts
   - You must import the vendor deps into app.js and app.css to use them
@@ -43,6 +71,67 @@ custom classes must fully style the input
 - Ensure **clean typography, spacing, and layout balance** for a refined, premium look
 - Focus on **delightful details** like hover effects, loading states, and smooth page transitions
 
+
+<!-- phoenix-gen-auth-start -->
+## Authentication
+
+- **Always** handle authentication flow at the router level with proper redirects
+- **Always** be mindful of where to place routes. `phx.gen.auth` creates multiple router plugs and `live_session` scopes:
+  - A plug `:fetch_current_scope_for_user` that is included in the default browser pipeline
+  - A plug `:require_authenticated_user` that redirects to the log in page when the user is not authenticated
+  - A `live_session :current_user` scope - for routes that need the current user but don't require authentication, similar to `:fetch_current_scope_for_user`
+  - A `live_session :require_authenticated_user` scope - for routes that require authentication, similar to the plug with the same name
+  - In both cases, a `@current_scope` is assigned to the Plug connection and LiveView socket
+  - A plug `redirect_if_user_is_authenticated` that redirects to a default path in case the user is authenticated - useful for a registration page that should only be shown to unauthenticated users
+- **Always let the user know in which router scopes, `live_session`, and pipeline you are placing the route, AND SAY WHY**
+- `phx.gen.auth` assigns the `current_scope` assign - it **does not assign a `current_user` assign**
+- Always pass the assign `current_scope` to context modules as first argument. When performing queries, use `current_scope.user` to filter the query results
+- To derive/access `current_user` in templates, **always use the `@current_scope.user`**, never use **`@current_user`** in templates or LiveViews
+- **Never** duplicate `live_session` names. A `live_session :current_user` can only be defined __once__ in the router, so all routes for the `live_session :current_user`  must be grouped in a single block
+- Anytime you hit `current_scope` errors or the logged in session isn't displaying the right content, **always double check the router and ensure you are using the correct plug and `live_session` as described below**
+
+### Routes that require authentication
+
+LiveViews that require login should **always be placed inside the __existing__ `live_session :require_authenticated_user` block**:
+
+    scope "/", AppWeb do
+      pipe_through [:browser, :require_authenticated_user]
+
+      live_session :require_authenticated_user,
+        on_mount: [{RealinvoiceCloudWeb.UserAuth, :require_authenticated}] do
+        # phx.gen.auth generated routes
+        live "/users/settings", UserLive.Settings, :edit
+        live "/users/settings/confirm-email/:token", UserLive.Settings, :confirm_email
+        # our own routes that require logged in user
+        live "/", MyLiveThatRequiresAuth, :index
+      end
+    end
+
+Controller routes must be placed in a scope that sets the `:require_authenticated_user` plug:
+
+    scope "/", AppWeb do
+      pipe_through [:browser, :require_authenticated_user]
+
+      get "/", MyControllerThatRequiresAuth, :index
+    end
+
+### Routes that work with or without authentication
+
+LiveViews that can work with or without authentication, **always use the __existing__ `:current_user` scope**, ie:
+
+    scope "/", MyAppWeb do
+      pipe_through [:browser]
+
+      live_session :current_user,
+        on_mount: [{RealinvoiceCloudWeb.UserAuth, :mount_current_scope}] do
+        # our own routes that work with or without authentication
+        live "/", PublicLive
+      end
+    end
+
+Controllers automatically have the `current_scope` available if they use the `:browser` pipeline.
+
+<!-- phoenix-gen-auth-end -->
 
 <!-- usage-rules-start -->
 
