@@ -35,6 +35,10 @@ admin@realinvoice.local / realinvoice-dev-password
 
 Sign in with it at `/users/log-in`. There is no sign-up page — see below.
 
+> **No `mix.lock` yet.** This stage was built in an environment that could not
+> reach `repo.hex.pm`, so the lockfile was never generated. The first
+> `mix deps.get` on a machine with Hex access will create one — commit it.
+
 ### Database configuration
 
 `config/dev.exs` and `config/test.exs` default to `postgres`/`postgres` on
