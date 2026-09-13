@@ -47,10 +47,15 @@ defmodule RealinvoiceCloudWeb.Router do
     live_session :require_authenticated_user,
       on_mount: [{RealinvoiceCloudWeb.UserAuth, :require_authenticated}] do
       live "/", DashboardLive, :dashboard
-      live "/invoices", SectionLive, :invoices
-      live "/customers", SectionLive, :customers
-      live "/items", SectionLive, :items
+
+      live "/invoices", InvoiceLive.Index, :index
+      live "/invoices/:id", InvoiceLive.Show, :show
+      live "/customers", CustomerLive.Index, :index
+      live "/items", ItemLive.Index, :index
+
+      # Still a placeholder: desk enrolment arrives with the ingest API.
       live "/nodes", SectionLive, :nodes
+
       live "/settings", SettingsLive, :settings
 
       live "/users/settings", UserLive.Settings, :edit

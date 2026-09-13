@@ -68,6 +68,50 @@ defmodule RealinvoiceCloudWeb.CoreComponents do
   end
 
   @doc """
+  A native `<select>`, styled to match SaladUI's input.
+
+  SaladUI's own `select/1` builds its hidden input in JavaScript after mount, so
+  its value is invisible to `phx-change` on first render and to
+  `render_change/2` in tests. Filter forms need a value the server can read
+  every time, so they use this instead; SaladUI's select stays the right choice
+  for rich in-page selection that is driven by its own events.
+
+  ## Examples
+
+      <.select_input name="node" value={@filters["node"]} prompt="All nodes">
+        <option :for={node <- @nodes} value={node} selected={@filters["node"] == node}>
+          {node}
+        </option>
+      </.select_input>
+  """
+  attr :id, :string, default: nil
+  attr :name, :string, required: true
+  attr :value, :any, default: nil
+  attr :prompt, :string, default: nil, doc: "a blank leading option, e.g. \"All nodes\""
+  attr :class, :any, default: nil
+  attr :rest, :global
+  slot :inner_block, required: true
+
+  def select_input(assigns) do
+    ~H"""
+    <select
+      id={@id}
+      name={@name}
+      class={[
+        "flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm",
+        "focus-visible:outline-hidden focus-visible:border-ring focus-visible:ring-ring/50",
+        "focus-visible:ring-[3px] disabled:cursor-not-allowed disabled:opacity-50",
+        @class
+      ]}
+      {@rest}
+    >
+      <option :if={@prompt} value="" selected={@value in [nil, ""]}>{@prompt}</option>
+      {render_slot(@inner_block)}
+    </select>
+    """
+  end
+
+  @doc """
   A centred icon + message block for screens that have nothing to show yet.
 
   SaladUI has no empty-state component, so this is a plain flat block built from

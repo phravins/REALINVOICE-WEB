@@ -4,10 +4,10 @@ The web back office for RealInvoice. Billing desks running the RealInvoice
 desktop app sync their invoices, customers and items up here, where an
 administrator can see the whole business in one place.
 
-**Stage 1 (this repo's current state) is the shell only.** Staff can sign in and
-move around the app, but nothing syncs yet: there is no ingest API and no Ecto
-schemas for invoices, customers or items. Those arrive once the desktop app has
-a sync worker and the payload shape it sends is settled.
+**Nothing syncs yet.** The data model, the reporting and the screens are built
+and backed by sample data, but there is no ingest API: the desks have no way to
+push anything up. That arrives once the desktop app has a sync worker and the
+payload shape it sends is settled.
 
 ## Stack
 
@@ -52,6 +52,62 @@ PGUSER=me PGPASSWORD=secret PGHOST=db.local mix phx.server
 Production reads `DATABASE_URL` and `SECRET_KEY_BASE` at runtime
 (`config/runtime.exs`). No production credentials live in this repo.
 
+## Data model
+
+Four tables mirror the desktop app's core data model, all under the
+`RealinvoiceCloud.Billing` context:
+
+| | |
+|---|---|
+| `customers` | name, GSTIN, place of supply, mobile |
+| `items` | code, description, rate, tax rate, UOM |
+| `invoices` | number, date, customer, subtotal, CGST/SGST/IGST, grand total, payment type, `created_by` |
+| `invoice_lines` | item, quantity, rate, tax rate, line total |
+
+Every row carries a `store_node_id` — the billing desk it came from. Two things
+follow from that, and both are enforced by the schema:
+
+  * **Invoice numbers are unique per desk, not globally.** Each desk numbers its
+    own invoices, so they all start again at `RI-2026-0001`. Item codes work the
+    same way.
+  * **A desk's figures are stored, never recomputed.** The desk is the authority
+    on what it charged a customer. The changesets check integrity (present,
+    non-negative, not both CGST/SGST and IGST at once) but do not reimplement the
+    GST arithmetic. Cross-checking the desk's maths is a sensible thing to add
+    when ingest exists; silently "correcting" it is not.
+
+Money is `Decimal` everywhere, never a float, and is displayed with Indian digit
+grouping (`₹12,34,567.50`) by `RealinvoiceCloudWeb.Format`.
+
+`invoices.customer_id` is nullable: a counter sale with no customer record is
+ordinary at a billing desk, and rejecting those on ingest would lose real
+invoices. Such an invoice shows as "Counter sale".
+
+`created_by` is a plain label. The cloud has no knowledge of a desk's local
+cashier accounts, so it stores whatever the desk sends rather than resolving it
+to a user.
+
+### Live updates
+
+`Billing.create_invoice/1` broadcasts on `"billing:invoices"`, and the invoice
+list and dashboard subscribe. When ingest starts calling that function, new
+invoices will appear in an open browser without a refresh. Nothing broadcasts in
+production yet, so the path is covered by tests rather than in use.
+
+## Sample data
+
+`mix run priv/repo/seeds.exs` creates 3 customers, 6 items and 13 invoices
+across two desks (`POS-01`, `POS-02`) and a spread of dates in the current
+month. It is deterministic — the same figures on every machine — and idempotent.
+To rebuild it from scratch:
+
+```sh
+RESEED=1 mix run priv/repo/seeds.exs
+```
+
+That discards and regenerates the billing data only; staff accounts are left
+alone.
+
 ## Accounts
 
 This is an internal admin tool, so **public registration is disabled** — there
@@ -94,15 +150,21 @@ browser and defaults to the operating system setting.
 
 ```
 lib/realinvoice_cloud/accounts/        auth context, user schema and tokens
+lib/realinvoice_cloud/billing.ex       queries, filters, dashboard figures, PubSub
+lib/realinvoice_cloud/billing/         customer, item, invoice, invoice_line
 lib/realinvoice_cloud_web/components/
   layouts.ex                           app shell (sidebar + top bar) and auth shell
   core_components.ex                   only what SaladUI does not cover
+  ../format.ex                         money, quantity and date formatting
 lib/realinvoice_cloud_web/live/
-  dashboard_live.ex                    landing page, empty until desks sync
-  section_live.ex                      Invoices/Customers/Items/Nodes placeholders
+  dashboard_live.ex                    today's revenue, counts, revenue by desk
+  invoice_live/                        invoice list (filters, live updates) and detail
+  customer_live/                       customer list
+  item_live/                           catalogue list
+  section_live.ex                      the Nodes placeholder
   settings_live.ex                     Settings → Account
   user_live/                           login, confirmation, email & password
-priv/repo/seeds.exs                    provisions the owner account
+priv/repo/seeds.exs                    owner account and sample billing data
 ```
 
 ## Common tasks

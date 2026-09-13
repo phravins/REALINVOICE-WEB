@@ -1,35 +1,14 @@
 defmodule RealinvoiceCloudWeb.SectionLive do
   @moduledoc """
-  Placeholder pages for the sections that are not built yet.
+  Placeholder page for a section that is not built yet.
 
-  Invoices, Customers, Items and Nodes all render the same "coming soon" block.
-  They exist now so the shell's navigation is complete and every sidebar entry
-  goes somewhere real; each one gets its own LiveView when it grows content.
+  Only Nodes is left: desk enrolment and sync status cannot be built until the
+  ingest API exists and desks actually register. Invoices, Customers and Items
+  have grown into their own LiveViews.
   """
   use RealinvoiceCloudWeb, :live_view
 
   @sections %{
-    invoices: %{
-      title: "Invoices",
-      subtitle: "Invoices synced up from your billing desks",
-      icon: "hero-document-text",
-      detail:
-        "Every invoice closed on a billing desk will land here, searchable by customer, date and desk."
-    },
-    customers: %{
-      title: "Customers",
-      subtitle: "The customer book, merged across desks",
-      icon: "hero-users",
-      detail:
-        "Customer records from each desk will be reconciled here into a single book for the whole business."
-    },
-    items: %{
-      title: "Items",
-      subtitle: "Your product and service catalogue",
-      icon: "hero-cube",
-      detail:
-        "The catalogue each desk bills against will be listed here, with the prices and tax rates in use."
-    },
     nodes: %{
       title: "Nodes",
       subtitle: "The billing desks reporting into this account",

@@ -25,8 +25,20 @@ the generated Phoenix guidance below:
 - **There is no public registration.** Accounts are provisioned by
   `priv/repo/seeds.exs` via `Accounts.create_staff_user/1`. Do not add a
   `/users/register` route.
-- Do not build the ingest API, sync logic, or Ecto schemas for invoices,
-  customers or items yet — those wait for the desktop app's sync worker.
+- **The billing data model lives in `RealinvoiceCloud.Billing`** (customers,
+  items, invoices, invoice lines). Every row carries a `store_node_id`; invoice
+  numbers and item codes are unique *per desk*, not globally.
+- **Never recompute a desk's GST figures.** Subtotal, CGST/SGST/IGST and grand
+  total are stored exactly as the desk sent them. Validations check integrity,
+  not arithmetic.
+- **Money is `Decimal`, never a float**, and is rendered through
+  `RealinvoiceCloudWeb.Format.money/1` (Indian digit grouping).
+- The billing tables are **read-only from the back office**: no create, update or
+  delete UI or context functions, because who owns editing this data — cloud or
+  desk — is not yet decided. Do not add one on a guess.
+- Do not build the ingest API or sync logic yet — that waits for the desktop
+  app's sync worker. `Billing.create_invoice/1` and its PubSub broadcast are the
+  seam it will plug into.
 
 ## Project guidelines
 

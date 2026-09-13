@@ -88,6 +88,8 @@ defmodule RealinvoiceCloudWeb do
       use SaladUI
       # App-level components: flash, JS transitions, error translation
       import RealinvoiceCloudWeb.CoreComponents
+      # Money, quantity and date formatting
+      import RealinvoiceCloudWeb.Format
 
       # Common modules used in templates
       alias Phoenix.LiveView.JS

@@ -37,18 +37,29 @@ defmodule RealinvoiceCloudWeb.DashboardShellTest do
       end
     end
 
-    test "the dashboard shows its empty state", %{conn: conn} do
+    test "the dashboard falls back to its empty state with no invoices", %{conn: conn} do
       {:ok, _lv, html} = live(conn, ~p"/")
 
       assert html =~ "No data yet"
       assert html =~ "once your billing desks start syncing"
     end
 
-    test "the unbuilt sections say so", %{conn: conn} do
-      for {path, name} <- @sections, path not in ["/", "/settings"] do
+    test "Nodes is still a placeholder", %{conn: conn} do
+      {:ok, _lv, html} = live(conn, ~p"/nodes")
+
+      assert html =~ "Coming soon"
+      assert html =~ "Nodes arrives once the desktop app starts syncing."
+    end
+
+    test "the built sections render their own empty states", %{conn: conn} do
+      for {path, empty} <- [
+            {"/invoices", "No invoices yet"},
+            {"/customers", "No customers yet"},
+            {"/items", "No items yet"}
+          ] do
         {:ok, _lv, html} = live(conn, path)
-        assert html =~ "Coming soon"
-        assert html =~ "#{name} arrives once the desktop app starts syncing."
+        refute html =~ "Coming soon"
+        assert html =~ empty
       end
     end
 
