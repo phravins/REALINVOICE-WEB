@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="csrf-token" content={get_csrf_token()} />
+    <.live_title default="Back office" suffix=" · RealInvoice Cloud" phx-no-format>{assigns[:page_title]}</.live_title>
+    <link phx-track-static rel="stylesheet" href={~p"/assets/css/app.css"} />
+    <script defer phx-track-static type="text/javascript" src={~p"/assets/js/app.js"}>
+    </script>
+    <script>
+      (() => {
+        const systemTheme = () => matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+
+        // `data-theme` is Phoenix's convention; the `dark` class is what
+        // SaladUI's design tokens key off. Keep both in step.
+        const applyTheme = (theme) => {
+          const resolved = theme === "system" ? systemTheme() : theme;
+          document.documentElement.setAttribute("data-theme", resolved);
+          document.documentElement.setAttribute("data-theme-source", theme === "system" ? "system" : "user");
+          document.documentElement.classList.toggle("dark", resolved === "dark");
+        };
+
+        const setTheme = (theme) => {
+          if (theme === "system") {
+            localStorage.removeItem("phx:theme");
+          } else {
+            localStorage.setItem("phx:theme", theme);
+          }
+          applyTheme(theme);
+        };
+
+        const storedTheme = () => localStorage.getItem("phx:theme") || "system";
+
+        applyTheme(storedTheme());
+
+        window.addEventListener("storage", (e) => e.key === "phx:theme" && applyTheme(e.newValue || "system"));
+
+        // `data-phx-theme="toggle"` flips light/dark from whatever is showing,
+        // which is what the single top-bar button uses.
+        window.addEventListener("phx:set-theme", (e) => {
+          const requested = e.target.dataset.phxTheme;
+          setTheme(
+            requested === "toggle"
+              ? (document.documentElement.classList.contains("dark") ? "light" : "dark")
+              : requested
+          );
+        });
+
+        matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
+          if (document.documentElement.getAttribute("data-theme-source") === "system") {
+            applyTheme("system");
+          }
+        });
+      })();
+    </script>
+  </head>
+  <body class="bg-background text-foreground antialiased">
+    {@inner_content}
+  </body>
+</html>
