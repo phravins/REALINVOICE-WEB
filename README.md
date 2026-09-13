@@ -4,10 +4,9 @@ The web back office for RealInvoice. Billing desks running the RealInvoice
 desktop app sync their invoices, customers and items up here, where an
 administrator can see the whole business in one place.
 
-**Nothing syncs yet.** The data model, the reporting and the screens are built
-and backed by sample data, but there is no ingest API: the desks have no way to
-push anything up. That arrives once the desktop app has a sync worker and the
-payload shape it sends is settled.
+Desks push their data to `POST /api/sync/ingest`; the screens update live as it
+arrives. **The endpoint is not secured yet** — see [Sync API](#sync-api) — so do
+not expose this server to an untrusted network until the hardening stage lands.
 
 ## Stack
 
@@ -90,9 +89,8 @@ to a user.
 ### Live updates
 
 `Billing.create_invoice/1` broadcasts on `"billing:invoices"`, and the invoice
-list and dashboard subscribe. When ingest starts calling that function, new
-invoices will appear in an open browser without a refresh. Nothing broadcasts in
-production yet, so the path is covered by tests rather than in use.
+list and dashboard subscribe. Ingest calls that function, so a synced invoice
+appears in an open browser without a refresh.
 
 ## Sample data
 
@@ -107,6 +105,118 @@ RESEED=1 mix run priv/repo/seeds.exs
 
 That discards and regenerates the billing data only; staff accounts are left
 alone.
+
+## Sync API
+
+`POST /api/sync/ingest` is where a billing desk's sync worker pushes its data.
+
+> ### Not yet secured
+>
+> The endpoint accepts **any non-empty token**. Nothing issues tokens, nothing
+> verifies them, and there is no tenant scoping: any client that can reach the
+> URL can write rows attributed to any `store_node_id`. All the token buys today
+> is that a desk has to be configured deliberately, and that the server can
+> record which desk claimed which token (SHA-256 digest only, in
+> `sync_node_claims`). Per-node issuance, rotation, revocation and scoping are
+> the hardening stage. Until then, keep this endpoint on a trusted network.
+
+### Request
+
+```
+POST /api/sync/ingest
+Authorization: Bearer <the desk's token>      (or: X-Api-Token: <token>)
+Content-Type: application/json
+```
+
+```json
+{
+  "store_node_id": "POS-01",
+  "rows": [
+    { "client_id": "c-9f2a", "type": "customer",
+      "data": { "name": "Vaanavil Systems Pvt Ltd", "gstin": "33AABCV1234M1Z7",
+                "place_of_supply": "Tamil Nadu", "mobile": "+91 98400 11223" } },
+
+    { "client_id": "i-41b7", "type": "item",
+      "data": { "item_code": "RK-42U-PRO", "description": "42U Server Rack Pro",
+                "rate": "48500.00", "tax_rate": "18.00", "uom": "Nos" } },
+
+    { "client_id": "v-77c1", "type": "invoice",
+      "data": { "invoice_no": "RI-2026-0001", "date": "2026-09-13",
+                "customer_client_id": "c-9f2a",
+                "subtotal": "48500.00", "cgst": "4365.00", "sgst": "4365.00",
+                "igst": "0.00", "grand_total": "57230.00",
+                "payment_type": "UPI", "created_by": "Anitha R (till-1)",
+                "lines": [ { "client_id": "l-1", "item_client_id": "i-41b7",
+                             "qty": "1", "rate": "48500.00", "tax_rate": "18.00",
+                             "line_total": "48500.00" } ] } }
+  ]
+}
+```
+
+  * `client_id` is the desk's own identifier for the row — any string, stable
+    forever, never reused. **This is what makes ingest idempotent**: a retried
+    batch finds what it already wrote instead of inserting it again.
+  * `type` is one of `customer`, `item`, `invoice`, `invoice_line`.
+  * Invoices name their customer with `customer_client_id`, and lines name their
+    item with `item_client_id` — the desk's identifiers, which the server
+    translates to its own primary keys. A desk never sends this server's ids.
+  * Lines may be **nested** in the invoice's `lines` (above) or sent as their own
+    `invoice_line` rows carrying `"invoice_client_id": "v-77c1"`. Both work; send
+    whichever suits the worker.
+  * Rows may arrive in any order — the server processes customers and items
+    first, then invoices, then standalone lines.
+  * `store_node_id` comes from the envelope and overrides anything in a row, so a
+    desk cannot file rows under another desk.
+  * Money and quantities are strings, to survive the trip without a float
+    rounding them.
+
+### Response
+
+Always `200` with a result per row, in the order sent — a batch is never all-or-
+nothing, so the worker can tell exactly which rows to retry or report:
+
+```json
+{
+  "batch": { "store_node_id": "POS-01", "received": 3, "accepted": 2, "rejected": 1 },
+  "results": [
+    { "client_id": "c-9f2a", "type": "customer", "status": "accepted",
+      "action": "inserted", "id": 12 },
+    { "client_id": "v-77c1", "type": "invoice", "status": "accepted",
+      "action": "unchanged", "id": 7 },
+    { "client_id": "i-41b7", "type": "item", "status": "rejected",
+      "errors": { "rate": ["must be greater than or equal to 0"] } }
+  ]
+}
+```
+
+`action` is `inserted`, `updated` or `unchanged`. `unchanged` means the row was
+already here — a successful retry, not a failure.
+
+Other statuses: `401` with no token, `422` when the batch itself cannot be read
+(no `store_node_id`, `rows` not a list, more than 1000 rows).
+
+### Rules
+
+  * **Idempotent.** Re-sending a batch changes nothing and reports the same ids.
+  * **Invoices are append-only.** Once stored, an invoice is never rewritten,
+    whatever a later batch says — a re-sent invoice comes back `unchanged`.
+    Customers and items are upserted, last write wins.
+  * **A row fails on its own.** Each unit is its own transaction, so one invalid
+    row does not roll back the rest of the batch. An invoice and its lines are a
+    single unit: all of it lands or none of it does.
+
+### Trying it
+
+```sh
+curl -X POST http://localhost:4000/api/sync/ingest \
+  -H 'Authorization: Bearer any-non-empty-token' \
+  -H 'Content-Type: application/json' \
+  -d @batch.json
+```
+
+An accepted invoice appears in the Invoices list and moves the Dashboard totals
+in any open browser immediately, with no refresh — `Billing.create_invoice/1`
+broadcasts on `"billing:invoices"` and both LiveViews subscribe.
 
 ## Accounts
 
@@ -152,10 +262,16 @@ browser and defaults to the operating system setting.
 lib/realinvoice_cloud/accounts/        auth context, user schema and tokens
 lib/realinvoice_cloud/billing.ex       queries, filters, dashboard figures, PubSub
 lib/realinvoice_cloud/billing/         customer, item, invoice, invoice_line
+lib/realinvoice_cloud/sync.ex          batch ingest: idempotency, per-row results
+lib/realinvoice_cloud/sync/            the node/token claim log
 lib/realinvoice_cloud_web/components/
   layouts.ex                           app shell (sidebar + top bar) and auth shell
   core_components.ex                   only what SaladUI does not cover
   ../format.ex                         money, quantity and date formatting
+lib/realinvoice_cloud_web/controllers/
+  sync_ingest_controller.ex            POST /api/sync/ingest
+lib/realinvoice_cloud_web/plugs/
+  require_sync_token.ex                the placeholder token check
 lib/realinvoice_cloud_web/live/
   dashboard_live.ex                    today's revenue, counts, revenue by desk
   invoice_live/                        invoice list (filters, live updates) and detail

@@ -79,12 +79,6 @@ defmodule RealinvoiceCloudWeb.Layouts do
             </.sidebar_group_content>
           </.sidebar_group>
         </.sidebar_content>
-
-        <.sidebar_footer class="px-3 py-4 group-data-[collapsible=icon]:hidden">
-          <p class="text-xs leading-relaxed text-muted-foreground">
-            Billing desks are not syncing yet.
-          </p>
-        </.sidebar_footer>
       </.sidebar>
 
       <%!-- min-w-0 keeps the main column from being widened past the viewport

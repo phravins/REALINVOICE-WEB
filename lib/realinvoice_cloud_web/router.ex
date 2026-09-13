@@ -17,10 +17,19 @@ defmodule RealinvoiceCloudWeb.Router do
     plug :accepts, ["json"]
   end
 
-  # Other scopes may use custom stacks.
-  # scope "/api", RealinvoiceCloudWeb do
-  #   pipe_through :api
-  # end
+  # The sync ingest API. Token-gated, but see
+  # RealinvoiceCloudWeb.Plugs.RequireSyncToken: the check is deliberately
+  # trivial at this stage and is not authentication.
+  pipeline :sync_api do
+    plug :accepts, ["json"]
+    plug RealinvoiceCloudWeb.Plugs.RequireSyncToken
+  end
+
+  scope "/api", RealinvoiceCloudWeb do
+    pipe_through :sync_api
+
+    post "/sync/ingest", SyncIngestController, :create
+  end
 
   # Enable LiveDashboard and Swoosh mailbox preview in development
   if Application.compile_env(:realinvoice_cloud, :dev_routes) do

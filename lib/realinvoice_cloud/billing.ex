@@ -215,6 +215,40 @@ defmodule RealinvoiceCloud.Billing do
     end)
   end
 
+  ## Lookup and upsert by the desk's client id
+
+  @doc """
+  Finds a record previously ingested under this client id, or `nil`.
+
+  This is what makes ingest idempotent: a retried batch finds what it already
+  wrote instead of writing it again.
+  """
+  def get_by_client_id(:customer, client_id), do: Repo.get_by(Customer, client_id: client_id)
+  def get_by_client_id(:item, client_id), do: Repo.get_by(Item, client_id: client_id)
+  def get_by_client_id(:invoice, client_id), do: Repo.get_by(Invoice, client_id: client_id)
+
+  def get_by_client_id(:invoice_line, client_id),
+    do: Repo.get_by(RealinvoiceCloud.Billing.InvoiceLine, client_id: client_id)
+
+  @doc """
+  Inserts a customer, or updates the one already stored under this client id.
+
+  Last write wins: a desk that edits a customer and re-syncs replaces what is
+  here. That is the right default while the desk is the only place this data is
+  editable.
+  """
+  def upsert_customer(nil, attrs), do: %Customer{} |> Customer.changeset(attrs) |> Repo.insert()
+
+  def upsert_customer(%Customer{} = customer, attrs),
+    do: customer |> Customer.changeset(attrs) |> Repo.update()
+
+  @doc """
+  Inserts a catalogue item, or updates the one already stored under this client id.
+  """
+  def upsert_item(nil, attrs), do: %Item{} |> Item.changeset(attrs) |> Repo.insert()
+
+  def upsert_item(%Item{} = item, attrs), do: item |> Item.changeset(attrs) |> Repo.update()
+
   ## Billing desks
 
   @doc """

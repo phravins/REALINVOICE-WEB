@@ -36,9 +36,17 @@ the generated Phoenix guidance below:
 - The billing tables are **read-only from the back office**: no create, update or
   delete UI or context functions, because who owns editing this data — cloud or
   desk — is not yet decided. Do not add one on a guess.
-- Do not build the ingest API or sync logic yet — that waits for the desktop
-  app's sync worker. `Billing.create_invoice/1` and its PubSub broadcast are the
-  seam it will plug into.
+- **Ingest lives in `RealinvoiceCloud.Sync`**, behind `POST /api/sync/ingest`.
+  Its rules — idempotency by the desk's `client_id`, append-only invoices,
+  upserted customers/items, one transaction per row so a bad row does not sink
+  the batch — are documented in that module and in the README. Do not weaken
+  them.
+- **The ingest endpoint is not secured.** Any non-empty token is accepted and
+  there is no tenant scoping. That is deliberate for this stage; the hardening
+  stage adds per-node issuance, rotation and scoping. Do not describe it as
+  secure, and do not build features that assume it is.
+- Ingest goes through `Billing.create_invoice/1`, which broadcasts. Anything
+  that writes invoices should go through it too, or the live screens go quiet.
 
 ## Project guidelines
 

@@ -21,6 +21,7 @@ defmodule RealinvoiceCloud.Billing.InvoiceLine do
     field :rate, :decimal
     field :tax_rate, :decimal
     field :line_total, :decimal
+    field :client_id, :string
 
     timestamps(type: :utc_datetime)
   end
@@ -33,12 +34,13 @@ defmodule RealinvoiceCloud.Billing.InvoiceLine do
   """
   def changeset(line, attrs) do
     line
-    |> cast(attrs, [:item_id, :qty, :rate, :tax_rate, :line_total])
+    |> cast(attrs, [:item_id, :qty, :rate, :tax_rate, :line_total, :client_id])
     |> validate_required([:item_id, :qty, :rate, :tax_rate, :line_total])
     |> validate_number(:qty, greater_than: 0)
     |> validate_number(:rate, greater_than_or_equal_to: 0)
     |> validate_number(:tax_rate, greater_than_or_equal_to: 0, less_than_or_equal_to: 100)
     |> validate_number(:line_total, greater_than_or_equal_to: 0)
     |> assoc_constraint(:item)
+    |> unique_constraint(:client_id)
   end
 end
