@@ -22,7 +22,7 @@ defmodule RealinvoiceCloudWeb.Layouts do
     %{key: :invoices, label: "Invoices", path: "/invoices", icon: "hero-document-text"},
     %{key: :customers, label: "Customers", path: "/customers", icon: "hero-users"},
     %{key: :items, label: "Items", path: "/items", icon: "hero-cube"},
-    %{key: :nodes, label: "Nodes", path: "/nodes", icon: "hero-server-stack"},
+    %{key: :nodes, label: "Nodes", path: "/nodes", icon: "hero-server-stack", owner_only: true},
     %{key: :settings, label: "Settings", path: "/settings", icon: "hero-cog-6-tooth"}
   ]
 
@@ -50,7 +50,7 @@ defmodule RealinvoiceCloudWeb.Layouts do
   slot :actions, doc: "buttons shown on the right of the page heading"
 
   def app(assigns) do
-    assigns = assign(assigns, :nav, @nav)
+    assigns = assign(assigns, :nav, nav_for(assigns[:current_scope]))
 
     ~H"""
     <.sidebar_provider>
@@ -112,6 +112,11 @@ defmodule RealinvoiceCloudWeb.Layouts do
     <.flash_group flash={@flash} />
     """
   end
+
+  # Managing billing desks is owner-only, so a staff user is not shown a door
+  # that bounces them.
+  defp nav_for(%{user: %{role: "owner"}}), do: @nav
+  defp nav_for(_scope), do: Enum.reject(@nav, & &1[:owner_only])
 
   @doc """
   Renders the signed-out shell used by the login screens.

@@ -41,10 +41,16 @@ the generated Phoenix guidance below:
   upserted customers/items, one transaction per row so a bad row does not sink
   the batch — are documented in that module and in the README. Do not weaken
   them.
-- **The ingest endpoint is not secured.** Any non-empty token is accepted and
-  there is no tenant scoping. That is deliberate for this stage; the hardening
-  stage adds per-node issuance, rotation and scoping. Do not describe it as
-  secure, and do not build features that assume it is.
+- **Ingest is authenticated by per-node API tokens** (`RealinvoiceCloud.Nodes`).
+  A token is hashed with SHA-256 and looked up against *active* nodes only;
+  anything else is a 401. There is no fallback — never reintroduce one.
+- A node token is shown once at registration and only its hash is stored. There
+  is deliberately no way to display it again; do not add one.
+- **Multi-tenancy is still deferred.** `nodes.tenant_id` exists and is indexed
+  but nothing populates or filters on it. A token is scoped to a desk, not a
+  tenant.
+- The identity of a synced row is **(node_id, client_id)**, never client_id
+  alone — client ids are only unique within the desk that generated them.
 - Ingest goes through `Billing.create_invoice/1`, which broadcasts. Anything
   that writes invoices should go through it too, or the live screens go quiet.
 

@@ -4,9 +4,8 @@ The web back office for RealInvoice. Billing desks running the RealInvoice
 desktop app sync their invoices, customers and items up here, where an
 administrator can see the whole business in one place.
 
-Desks push their data to `POST /api/sync/ingest`; the screens update live as it
-arrives. **The endpoint is not secured yet** — see [Sync API](#sync-api) — so do
-not expose this server to an untrusted network until the hardening stage lands.
+Desks push their data to `POST /api/sync/ingest`, authenticated with a per-desk
+API token issued from the back office; the screens update live as it arrives.
 
 ## Stack
 
@@ -110,15 +109,15 @@ alone.
 
 `POST /api/sync/ingest` is where a billing desk's sync worker pushes its data.
 
-> ### Not yet secured
->
-> The endpoint accepts **any non-empty token**. Nothing issues tokens, nothing
-> verifies them, and there is no tenant scoping: any client that can reach the
-> URL can write rows attributed to any `store_node_id`. All the token buys today
-> is that a desk has to be configured deliberately, and that the server can
-> record which desk claimed which token (SHA-256 digest only, in
-> `sync_node_claims`). Per-node issuance, rotation, revocation and scoping are
-> the hardening stage. Until then, keep this endpoint on a trusted network.
+Every request must present the token of a desk registered under **Settings →
+Nodes**. The token is hashed on the way in and looked up against active nodes
+only; anything that does not resolve to one is a `401`. There is no fallback and
+no way to sync without a token.
+
+What is still deferred: **multi-tenancy**. Every registered node belongs to the
+one account this server holds. The `nodes.tenant_id` column exists and is
+indexed, but nothing populates or filters on it, so a token is scoped to a desk
+and not yet to a tenant.
 
 ### Request
 
@@ -130,7 +129,6 @@ Content-Type: application/json
 
 ```json
 {
-  "store_node_id": "POS-01",
   "rows": [
     { "client_id": "c-9f2a", "type": "customer",
       "data": { "name": "Vaanavil Systems Pvt Ltd", "gstin": "33AABCV1234M1Z7",
@@ -165,8 +163,10 @@ Content-Type: application/json
     whichever suits the worker.
   * Rows may arrive in any order — the server processes customers and items
     first, then invoices, then standalone lines.
-  * `store_node_id` comes from the envelope and overrides anything in a row, so a
-    desk cannot file rows under another desk.
+  * **The desk is whichever node's token authenticated the request.** There is no
+    `store_node_id` in the payload — it comes from the node's name. A desk cannot
+    claim to be another desk, and a `store_node_id` sent anyway is ignored (and
+    logged, since it means a misconfiguration).
   * Money and quantities are strings, to survive the trip without a float
     rounding them.
 
@@ -192,12 +192,17 @@ nothing, so the worker can tell exactly which rows to retry or report:
 `action` is `inserted`, `updated` or `unchanged`. `unchanged` means the row was
 already here — a successful retry, not a failure.
 
-Other statuses: `401` with no token, `422` when the batch itself cannot be read
-(no `store_node_id`, `rows` not a list, more than 1000 rows).
+Other statuses: `401` when the token is missing, unknown, or belongs to a revoked
+node — one identical response for all three, so the endpoint cannot be used to
+probe which tokens exist. `422` when the batch itself cannot be read (`rows` not
+a list, more than 1000 rows).
 
 ### Rules
 
-  * **Idempotent.** Re-sending a batch changes nothing and reports the same ids.
+  * **Idempotent, per desk.** Re-sending a batch changes nothing and reports the
+    same ids. A row's identity is (node, `client_id`) — client ids are generated
+    by a desk and are only unique within it, so two desks may use the same id for
+    unrelated rows without colliding.
   * **Invoices are append-only.** Once stored, an invoice is never rewritten,
     whatever a later batch says — a re-sent invoice comes back `unchanged`.
     Customers and items are upserted, last write wins.
@@ -207,9 +212,11 @@ Other statuses: `401` with no token, `422` when the batch itself cannot be read
 
 ### Trying it
 
+Register a desk under **Settings → Nodes**, copy the token it shows you, then:
+
 ```sh
 curl -X POST http://localhost:4000/api/sync/ingest \
-  -H 'Authorization: Bearer any-non-empty-token' \
+  -H 'Authorization: Bearer rin_the-token-you-copied' \
   -H 'Content-Type: application/json' \
   -d @batch.json
 ```
@@ -217,6 +224,31 @@ curl -X POST http://localhost:4000/api/sync/ingest \
 An accepted invoice appears in the Invoices list and moves the Dashboard totals
 in any open browser immediately, with no refresh — `Billing.create_invoice/1`
 broadcasts on `"billing:invoices"` and both LiveViews subscribe.
+
+## Billing desks (nodes)
+
+A node is a billing desk allowed to sync. Owners register them under **Settings →
+Nodes**; staff accounts cannot see the page and the nav entry is hidden from them.
+
+Registering a node issues a token and **shows it exactly once**. The server keeps
+only its SHA-256, so there is no "show it again" — if the token is lost, register
+the desk again. Revoking a node flips its status and its token stops working on
+its very next request; the record and its history stay, and it can be reinstated
+with the same token.
+
+The list shows each desk's status and `last_seen_at`, which is updated on every
+successful ingest request — that is the signal a per-desk health display is built
+on.
+
+### Why SHA-256 rather than bcrypt
+
+Passwords get bcrypt because they are low-entropy and guessable, and the cost is
+the defence. A node token is 32 bytes straight from the CSPRNG, so there is
+nothing to guess. More practically, bcrypt salts every hash, so a bcrypt hash
+cannot be looked up — authenticating a request would mean running bcrypt against
+every active node in turn. SHA-256 makes it one indexed row read, which is what
+this application's own `Accounts.UserToken` already does for session and
+magic-link tokens.
 
 ## Accounts
 
@@ -263,7 +295,8 @@ lib/realinvoice_cloud/accounts/        auth context, user schema and tokens
 lib/realinvoice_cloud/billing.ex       queries, filters, dashboard figures, PubSub
 lib/realinvoice_cloud/billing/         customer, item, invoice, invoice_line
 lib/realinvoice_cloud/sync.ex          batch ingest: idempotency, per-row results
-lib/realinvoice_cloud/sync/            the node/token claim log
+lib/realinvoice_cloud/nodes.ex         registering desks, authenticating tokens
+lib/realinvoice_cloud/nodes/           the node schema
 lib/realinvoice_cloud_web/components/
   layouts.ex                           app shell (sidebar + top bar) and auth shell
   core_components.ex                   only what SaladUI does not cover
@@ -271,13 +304,13 @@ lib/realinvoice_cloud_web/components/
 lib/realinvoice_cloud_web/controllers/
   sync_ingest_controller.ex            POST /api/sync/ingest
 lib/realinvoice_cloud_web/plugs/
-  require_sync_token.ex                the placeholder token check
+  require_sync_token.ex                resolves a token to an active node
 lib/realinvoice_cloud_web/live/
   dashboard_live.ex                    today's revenue, counts, revenue by desk
   invoice_live/                        invoice list (filters, live updates) and detail
   customer_live/                       customer list
   item_live/                           catalogue list
-  section_live.ex                      the Nodes placeholder
+  node_live/                           registering and revoking billing desks
   settings_live.ex                     Settings → Account
   user_live/                           login, confirmation, email & password
 priv/repo/seeds.exs                    owner account and sample billing data

@@ -10,17 +10,16 @@ defmodule RealinvoiceCloudWeb.SyncLiveUpdateTest do
 
   import Phoenix.LiveViewTest
   import RealinvoiceCloud.AccountsFixtures
-
-  @token "desk-token-abc"
+  import RealinvoiceCloud.NodesFixtures
 
   setup %{conn: conn} do
-    %{conn: log_in_user(conn, user_fixture())}
+    {node, token} = node_with_token(%{name: "POS-07"})
+    %{conn: log_in_user(conn, user_fixture()), node: node, token: token}
   end
 
   defp batch(overrides \\ %{}) do
     Map.merge(
       %{
-        "store_node_id" => "POS-07",
         "rows" => [
           %{
             "client_id" => "item-1",
@@ -65,20 +64,20 @@ defmodule RealinvoiceCloudWeb.SyncLiveUpdateTest do
   end
 
   # A separate connection, the way the desk's worker would arrive.
-  defp sync_post(payload) do
+  defp sync_post(token, payload) do
     build_conn()
     |> put_req_header("content-type", "application/json")
-    |> put_req_header("authorization", "Bearer " <> @token)
+    |> put_req_header("authorization", "Bearer " <> token)
     |> post(~p"/api/sync/ingest", payload)
   end
 
-  test "a synced invoice appears in the list without a reload", %{conn: conn} do
+  test "a synced invoice appears in the list without a reload", %{conn: conn, token: token} do
     {:ok, lv, html} = live(conn, ~p"/invoices")
 
     refute html =~ "RI-SYNCED-0001"
     assert html =~ "No invoices yet"
 
-    assert json_response(sync_post(batch()), 200)["batch"]["rejected"] == 0
+    assert json_response(sync_post(token, batch()), 200)["batch"]["rejected"] == 0
 
     html = render(lv)
     assert html =~ "RI-SYNCED-0001"
@@ -88,12 +87,12 @@ defmodule RealinvoiceCloudWeb.SyncLiveUpdateTest do
     assert has_element?(lv, ~s{#filter-node option[value="POS-07"]})
   end
 
-  test "the dashboard's figures move without a reload", %{conn: conn} do
+  test "the dashboard's figures move without a reload", %{conn: conn, token: token} do
     {:ok, lv, html} = live(conn, ~p"/")
 
     assert html =~ "No data yet"
 
-    sync_post(batch())
+    sync_post(token, batch())
 
     html = render(lv)
     refute html =~ "No data yet"
@@ -102,19 +101,22 @@ defmodule RealinvoiceCloudWeb.SyncLiveUpdateTest do
     assert html =~ "POS-07"
   end
 
-  test "a synced invoice that does not match the open filter is not shown", %{conn: conn} do
+  test "a synced invoice that does not match the open filter is not shown", %{
+    conn: conn,
+    token: token
+  } do
     {:ok, lv, _html} = live(conn, ~p"/invoices?node=POS-99")
 
-    sync_post(batch())
+    sync_post(token, batch())
 
     refute render(lv) =~ "RI-SYNCED-0001"
   end
 
-  test "a retried batch does not add the invoice to the list twice", %{conn: conn} do
+  test "a retried batch does not add the invoice to the list twice", %{conn: conn, token: token} do
     {:ok, lv, _html} = live(conn, ~p"/invoices")
 
-    sync_post(batch())
-    sync_post(batch())
+    sync_post(token, batch())
+    sync_post(token, batch())
 
     html = render(lv)
     assert html =~ "1 invoice"
@@ -123,7 +125,7 @@ defmodule RealinvoiceCloudWeb.SyncLiveUpdateTest do
     assert occurrences == 1
   end
 
-  test "a rejected invoice changes nothing on screen", %{conn: conn} do
+  test "a rejected invoice changes nothing on screen", %{conn: conn, token: token} do
     {:ok, lv, _html} = live(conn, ~p"/invoices")
 
     broken =
@@ -135,7 +137,7 @@ defmodule RealinvoiceCloudWeb.SyncLiveUpdateTest do
         end)
       end)
 
-    assert json_response(sync_post(broken), 200)["batch"]["rejected"] == 1
+    assert json_response(sync_post(token, broken), 200)["batch"]["rejected"] == 1
 
     html = render(lv)
     refute html =~ "RI-SYNCED-0001"

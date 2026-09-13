@@ -3,19 +3,24 @@ defmodule RealinvoiceCloudWeb.SyncIngestControllerTest do
 
   import Ecto.Query
 
-  alias RealinvoiceCloud.Billing
-  alias RealinvoiceCloud.Repo
-  alias RealinvoiceCloud.Sync
+  import RealinvoiceCloud.NodesFixtures
 
-  @token "desk-token-abc"
+  alias RealinvoiceCloud.Billing
+  alias RealinvoiceCloud.Nodes
+  alias RealinvoiceCloud.Repo
 
   setup %{conn: conn} do
-    %{conn: put_req_header(conn, "content-type", "application/json")}
+    {node, token} = node_with_token(%{name: "POS-07"})
+
+    conn =
+      conn
+      |> put_req_header("content-type", "application/json")
+      |> put_req_header("authorization", "Bearer " <> token)
+
+    %{conn: conn, node: node, token: token}
   end
 
-  defp authed(conn), do: put_req_header(conn, "authorization", "Bearer " <> @token)
-
-  defp ingest(conn, batch), do: post(authed(conn), ~p"/api/sync/ingest", batch)
+  defp ingest(conn, batch), do: post(conn, ~p"/api/sync/ingest", batch)
 
   defp customer_row(client_id, overrides \\ %{}) do
     %{
@@ -78,7 +83,6 @@ defmodule RealinvoiceCloudWeb.SyncIngestControllerTest do
 
   defp full_batch do
     %{
-      "store_node_id" => "POS-07",
       "rows" => [
         customer_row("cust-1"),
         item_row("item-1"),
@@ -99,7 +103,10 @@ defmodule RealinvoiceCloudWeb.SyncIngestControllerTest do
 
   describe "authentication" do
     test "rejects a request with no token", %{conn: conn} do
-      conn = post(conn, ~p"/api/sync/ingest", full_batch())
+      conn =
+        conn
+        |> delete_req_header("authorization")
+        |> post(~p"/api/sync/ingest", full_batch())
 
       assert json_response(conn, 401)["error"] == "unauthorized"
     end
@@ -113,41 +120,141 @@ defmodule RealinvoiceCloudWeb.SyncIngestControllerTest do
       assert json_response(conn, 401)["error"] == "unauthorized"
     end
 
-    test "accepts the token in x-api-token as well", %{conn: conn} do
+    test "rejects a made-up token", %{conn: conn} do
       conn =
         conn
-        |> put_req_header("x-api-token", @token)
+        |> put_req_header("authorization", "Bearer rin_totally-made-up-token")
+        |> post(~p"/api/sync/ingest", full_batch())
+
+      assert json_response(conn, 401)["error"] == "unauthorized"
+      assert Repo.aggregate(Billing.Invoice, :count) == 0
+    end
+
+    test "rejects any non-empty token that is not an issued one", %{conn: conn} do
+      # The behaviour this stage removed: garbage used to be accepted.
+      for garbage <- ["x", "hunter2", "Bearer", "rin_", String.duplicate("a", 64)] do
+        conn =
+          conn
+          |> put_req_header("authorization", "Bearer " <> garbage)
+          |> post(~p"/api/sync/ingest", full_batch())
+
+        assert json_response(conn, 401)["error"] == "unauthorized"
+      end
+
+      assert Repo.aggregate(Billing.Invoice, :count) == 0
+    end
+
+    test "rejects a token belonging to a revoked node", %{conn: conn} do
+      {_node, token} = revoked_node_with_token(%{name: "POS-GONE"})
+
+      conn =
+        conn
+        |> put_req_header("authorization", "Bearer " <> token)
+        |> post(~p"/api/sync/ingest", full_batch())
+
+      assert json_response(conn, 401)["error"] == "unauthorized"
+    end
+
+    test "a node revoked between requests is rejected on its very next one", %{
+      conn: conn,
+      node: node
+    } do
+      assert json_response(ingest(conn, full_batch()), 200)
+
+      {:ok, _node} = Nodes.revoke_node(node)
+
+      retry = post(conn, ~p"/api/sync/ingest", full_batch())
+      assert json_response(retry, 401)["error"] == "unauthorized"
+    end
+
+    test "a reinstated node works again with the token it already had", %{conn: conn, node: node} do
+      {:ok, node} = Nodes.revoke_node(node)
+      assert json_response(post(conn, ~p"/api/sync/ingest", full_batch()), 401)
+
+      {:ok, _node} = Nodes.reinstate_node(node)
+      assert json_response(post(conn, ~p"/api/sync/ingest", full_batch()), 200)
+    end
+
+    test "accepts the token in x-api-token as well", %{conn: conn, token: token} do
+      conn =
+        conn
+        |> delete_req_header("authorization")
+        |> put_req_header("x-api-token", token)
         |> post(~p"/api/sync/ingest", full_batch())
 
       assert json_response(conn, 200)["batch"]["accepted"] == 4
     end
 
-    test "accepts any non-empty token, because nothing issues tokens yet", %{conn: conn} do
-      conn =
-        conn
-        |> put_req_header("authorization", "Bearer literally-anything")
-        |> post(~p"/api/sync/ingest", full_batch())
+    test "does not say why a token failed", %{conn: conn} do
+      {_node, revoked_token} = revoked_node_with_token(%{name: "POS-GONE"})
 
-      assert json_response(conn, 200)["batch"]["accepted"] == 4
+      unknown =
+        conn
+        |> put_req_header("authorization", "Bearer rin_unknown")
+        |> post(~p"/api/sync/ingest", full_batch())
+        |> json_response(401)
+
+      revoked =
+        conn
+        |> put_req_header("authorization", "Bearer " <> revoked_token)
+        |> post(~p"/api/sync/ingest", full_batch())
+        |> json_response(401)
+
+      # Distinguishing "unknown" from "revoked" would hand a caller a probe.
+      assert unknown == revoked
+    end
+  end
+
+  describe "last_seen_at" do
+    test "is set on the first successful request", %{conn: conn, node: node} do
+      assert is_nil(node.last_seen_at)
+
+      ingest(conn, full_batch())
+
+      assert %DateTime{} = Nodes.get_node!(node.id).last_seen_at
+    end
+
+    test "moves on each successful request", %{conn: conn, node: node} do
+      ingest(conn, full_batch())
+      first = Nodes.get_node!(node.id).last_seen_at
+
+      # Rewind so a second request within the same second still shows a change.
+      Nodes.get_node!(node.id)
+      |> Ecto.Changeset.change(last_seen_at: DateTime.add(first, -60, :second))
+      |> Repo.update!()
+
+      ingest(conn, full_batch())
+
+      assert DateTime.compare(Nodes.get_node!(node.id).last_seen_at, first) in [:eq, :gt]
+    end
+
+    test "is not touched by a rejected token", %{conn: conn} do
+      {node, _token} = revoked_node_with_token(%{name: "POS-GONE"})
+
+      conn
+      |> put_req_header("authorization", "Bearer rin_nope")
+      |> post(~p"/api/sync/ingest", full_batch())
+
+      assert is_nil(Nodes.get_node!(node.id).last_seen_at)
     end
   end
 
   describe "a malformed batch" do
-    test "is rejected without a store_node_id", %{conn: conn} do
+    test "an empty batch is accepted and does nothing", %{conn: conn} do
       conn = ingest(conn, %{"rows" => []})
 
-      assert json_response(conn, 422)["error"] == "invalid_batch"
+      assert json_response(conn, 200)["batch"]["received"] == 0
     end
 
     test "is rejected when rows is not a list", %{conn: conn} do
-      conn = ingest(conn, %{"store_node_id" => "POS-07", "rows" => %{"nope" => true}})
+      conn = ingest(conn, %{"rows" => %{"nope" => true}})
 
       assert json_response(conn, 422)["detail"] =~ "rows must be a list"
     end
 
     test "is rejected when it carries too many rows", %{conn: conn} do
       rows = for n <- 1..1001, do: customer_row("cust-#{n}")
-      conn = ingest(conn, %{"store_node_id" => "POS-07", "rows" => rows})
+      conn = ingest(conn, %{"rows" => rows})
 
       assert json_response(conn, 422)["detail"] =~ "at most 1000 rows"
     end
@@ -177,10 +284,11 @@ defmodule RealinvoiceCloudWeb.SyncIngestControllerTest do
       assert results["line-1"]["type"] == "invoice_line"
     end
 
-    test "stores the invoice with its customer, its line and its item", %{conn: conn} do
+    test "stores the invoice with its customer, its line and its item", %{conn: conn, node: node} do
       ingest(conn, full_batch())
 
-      invoice = Billing.get_by_client_id(:invoice, "inv-1") |> then(&Billing.get_invoice!(&1.id))
+      invoice =
+        Billing.get_by_client_id(:invoice, node.id, "inv-1") |> then(&Billing.get_invoice!(&1.id))
 
       assert invoice.invoice_no == "RI-2026-0001"
       assert invoice.store_node_id == "POS-07"
@@ -193,9 +301,11 @@ defmodule RealinvoiceCloudWeb.SyncIngestControllerTest do
       assert Decimal.equal?(line.line_total, Decimal.new("96000.00"))
     end
 
-    test "accepts lines nested inside the invoice instead of as their own rows", %{conn: conn} do
+    test "accepts lines nested inside the invoice instead of as their own rows", %{
+      conn: conn,
+      node: node
+    } do
       batch = %{
-        "store_node_id" => "POS-07",
         "rows" => [
           item_row("item-1"),
           invoice_row("inv-1", %{
@@ -207,37 +317,30 @@ defmodule RealinvoiceCloudWeb.SyncIngestControllerTest do
       conn = ingest(conn, batch)
       assert json_response(conn, 200)["batch"]["rejected"] == 0
 
-      invoice = Billing.get_by_client_id(:invoice, "inv-1") |> then(&Billing.get_invoice!(&1.id))
+      invoice =
+        Billing.get_by_client_id(:invoice, node.id, "inv-1") |> then(&Billing.get_invoice!(&1.id))
+
       assert [%{client_id: "nested-1"}] = invoice.lines
     end
 
-    test "does not need the rows in dependency order", %{conn: conn} do
+    test "does not need the rows in dependency order", %{conn: conn, node: node} do
       batch = full_batch() |> Map.update!("rows", &Enum.reverse/1)
 
       conn = ingest(conn, batch)
 
       assert json_response(conn, 200)["batch"]["accepted"] == 4
-      assert Billing.get_by_client_id(:invoice, "inv-1")
+      assert Billing.get_by_client_id(:invoice, node.id, "inv-1")
     end
 
-    test "records which desk claimed the token, by digest and not in the clear", %{conn: conn} do
+    test "files every row under the authenticated node", %{conn: conn, node: node} do
       ingest(conn, full_batch())
 
-      assert [claim] = Sync.list_node_claims()
-      assert claim.store_node_id == "POS-07"
-      assert claim.batch_count == 1
-      assert claim.row_count == 4
-      refute claim.token_digest == @token
-      assert claim.token_digest == :sha256 |> :crypto.hash(@token) |> Base.encode16(case: :lower)
-    end
-
-    test "counts further batches against the same claim", %{conn: conn} do
-      ingest(conn, full_batch())
-      ingest(conn, full_batch())
-
-      assert [claim] = Sync.list_node_claims()
-      assert claim.batch_count == 2
-      assert claim.row_count == 8
+      invoice = Billing.get_by_client_id(:invoice, node.id, "inv-1")
+      assert invoice.store_node_id == "POS-07"
+      assert invoice.node_id == node.id
+      assert Billing.get_by_client_id(:customer, node.id, "cust-1").node_id == node.id
+      assert Billing.get_by_client_id(:item, node.id, "item-1").node_id == node.id
+      assert Billing.get_by_client_id(:invoice_line, node.id, "line-1").node_id == node.id
     end
   end
 
@@ -283,7 +386,6 @@ defmodule RealinvoiceCloudWeb.SyncIngestControllerTest do
 
       # The worker retries only the line, its invoice having been acknowledged.
       line_only = %{
-        "store_node_id" => "POS-07",
         "rows" => [
           %{
             "client_id" => "line-1",
@@ -303,7 +405,10 @@ defmodule RealinvoiceCloudWeb.SyncIngestControllerTest do
   end
 
   describe "invoices are append-only" do
-    test "a re-sent invoice is never rewritten, even with different figures", %{conn: conn} do
+    test "a re-sent invoice is never rewritten, even with different figures", %{
+      conn: conn,
+      node: node
+    } do
       ingest(conn, full_batch())
 
       amended =
@@ -322,7 +427,7 @@ defmodule RealinvoiceCloudWeb.SyncIngestControllerTest do
 
       assert results["inv-1"]["action"] == "unchanged"
 
-      invoice = Billing.get_by_client_id(:invoice, "inv-1")
+      invoice = Billing.get_by_client_id(:invoice, node.id, "inv-1")
       assert Decimal.equal?(invoice.grand_total, Decimal.new("113280.00"))
     end
 
@@ -330,7 +435,6 @@ defmodule RealinvoiceCloudWeb.SyncIngestControllerTest do
       ingest(conn, full_batch())
 
       clash = %{
-        "store_node_id" => "POS-07",
         "rows" => [
           item_row("item-2", %{"item_code" => "OTHER"}),
           invoice_row("inv-2", %{
@@ -351,36 +455,81 @@ defmodule RealinvoiceCloudWeb.SyncIngestControllerTest do
     test "the same invoice number on a different desk is fine", %{conn: conn} do
       ingest(conn, full_batch())
 
-      other_desk =
-        full_batch()
-        |> Map.put("store_node_id", "POS-08")
-        |> Map.update!("rows", fn rows ->
-          Enum.map(rows, fn row ->
-            Map.update!(row, "client_id", &(&1 <> "-b"))
-          end)
-        end)
-        |> Map.update!("rows", fn rows ->
-          Enum.map(rows, fn
-            %{"type" => "invoice"} = row ->
-              put_in(row, ["data", "customer_client_id"], "cust-1-b")
+      {_other_node, other_token} = node_with_token(%{name: "POS-08"})
 
-            %{"type" => "invoice_line"} = row ->
-              Map.put(row, "invoice_client_id", "inv-1-b")
+      other_conn =
+        build_conn()
+        |> put_req_header("content-type", "application/json")
+        |> put_req_header("authorization", "Bearer " <> other_token)
 
-            row ->
-              row
-          end)
-        end)
-
-      assert json_response(ingest(conn, other_desk), 200)["batch"]["rejected"] == 0
+      assert json_response(ingest(other_conn, full_batch()), 200)["batch"]["rejected"] == 0
       assert Repo.aggregate(Billing.Invoice, :count) == 2
     end
   end
 
+  describe "client ids are scoped to the node" do
+    test "two desks may use the same client ids without colliding", %{conn: conn} do
+      {_other_node, other_token} = node_with_token(%{name: "POS-08"})
+
+      other_conn =
+        build_conn()
+        |> put_req_header("content-type", "application/json")
+        |> put_req_header("authorization", "Bearer " <> other_token)
+
+      # Byte-for-byte the same batch, from two different desks. Under a global
+      # unique index on client_id the second desk's rows would be rejected as
+      # duplicates of the first's.
+      assert json_response(ingest(conn, full_batch()), 200)["batch"]["rejected"] == 0
+      assert json_response(ingest(other_conn, full_batch()), 200)["batch"]["rejected"] == 0
+
+      assert Repo.aggregate(Billing.Invoice, :count) == 2
+      assert Repo.aggregate(Billing.Customer, :count) == 2
+      assert Repo.aggregate(Billing.Item, :count) == 2
+      assert Repo.aggregate(Billing.InvoiceLine, :count) == 2
+    end
+
+    test "each desk's rows stay distinct records", %{conn: conn, node: node} do
+      {other_node, other_token} = node_with_token(%{name: "POS-08"})
+
+      other_conn =
+        build_conn()
+        |> put_req_header("content-type", "application/json")
+        |> put_req_header("authorization", "Bearer " <> other_token)
+
+      ingest(conn, full_batch())
+      ingest(other_conn, full_batch())
+
+      mine = Billing.get_by_client_id(:invoice, node.id, "inv-1")
+      theirs = Billing.get_by_client_id(:invoice, other_node.id, "inv-1")
+
+      refute mine.id == theirs.id
+      assert mine.store_node_id == "POS-07"
+      assert theirs.store_node_id == "POS-08"
+    end
+
+    test "one desk's retry never resolves to another desk's record", %{conn: conn} do
+      {other_node, other_token} = node_with_token(%{name: "POS-08"})
+
+      other_conn =
+        build_conn()
+        |> put_req_header("content-type", "application/json")
+        |> put_req_header("authorization", "Bearer " <> other_token)
+
+      ingest(conn, full_batch())
+      results = other_conn |> ingest(full_batch()) |> results_by_client_id()
+
+      # POS-08 has never sent these ids before, so they are inserts, not
+      # matches against POS-07's rows.
+      assert results["inv-1"]["action"] == "inserted"
+
+      assert results["inv-1"]["id"] ==
+               Billing.get_by_client_id(:invoice, other_node.id, "inv-1").id
+    end
+  end
+
   describe "per-row rejection" do
-    test "one bad row does not take the good ones down with it", %{conn: conn} do
+    test "one bad row does not take the good ones down with it", %{conn: conn, node: node} do
       batch = %{
-        "store_node_id" => "POS-07",
         "rows" => [
           customer_row("cust-1"),
           # A negative rate fails the stage 2 item changeset.
@@ -409,13 +558,12 @@ defmodule RealinvoiceCloudWeb.SyncIngestControllerTest do
       assert results["cust-1"]["status"] == "accepted"
       assert results["inv-1"]["status"] == "accepted"
 
-      assert Billing.get_by_client_id(:invoice, "inv-1")
-      refute Billing.get_by_client_id(:item, "item-bad")
+      assert Billing.get_by_client_id(:invoice, node.id, "inv-1")
+      refute Billing.get_by_client_id(:item, node.id, "item-bad")
     end
 
     test "an invalid invoice takes its own lines with it and nothing else", %{conn: conn} do
       batch = %{
-        "store_node_id" => "POS-07",
         "rows" => [
           customer_row("cust-1"),
           item_row("item-1"),
@@ -444,7 +592,6 @@ defmodule RealinvoiceCloudWeb.SyncIngestControllerTest do
 
     test "rejects a row with no client_id", %{conn: conn} do
       batch = %{
-        "store_node_id" => "POS-07",
         "rows" => [%{"type" => "customer", "data" => %{"name" => "X"}}]
       }
 
@@ -455,7 +602,6 @@ defmodule RealinvoiceCloudWeb.SyncIngestControllerTest do
 
     test "rejects an unknown row type", %{conn: conn} do
       batch = %{
-        "store_node_id" => "POS-07",
         "rows" => [%{"client_id" => "x-1", "type" => "spaceship", "data" => %{}}]
       }
 
@@ -466,7 +612,6 @@ defmodule RealinvoiceCloudWeb.SyncIngestControllerTest do
 
     test "rejects a row whose data is not an object", %{conn: conn} do
       batch = %{
-        "store_node_id" => "POS-07",
         "rows" => [%{"client_id" => "x-1", "type" => "customer", "data" => "nope"}]
       }
 
@@ -476,7 +621,6 @@ defmodule RealinvoiceCloudWeb.SyncIngestControllerTest do
 
     test "rejects a line with no invoice to attach to", %{conn: conn} do
       batch = %{
-        "store_node_id" => "POS-07",
         "rows" => [
           %{
             "client_id" => "line-orphan",
@@ -494,7 +638,6 @@ defmodule RealinvoiceCloudWeb.SyncIngestControllerTest do
 
     test "rejects a line that names no invoice at all", %{conn: conn} do
       batch = %{
-        "store_node_id" => "POS-07",
         "rows" => [%{"client_id" => "line-1", "type" => "invoice_line", "data" => line_data()}]
       }
 
@@ -504,22 +647,20 @@ defmodule RealinvoiceCloudWeb.SyncIngestControllerTest do
   end
 
   describe "what a desk is not allowed to decide" do
-    test "the envelope's store_node_id overrides whatever a row claims", %{conn: conn} do
+    test "the envelope's store_node_id overrides whatever a row claims", %{conn: conn, node: node} do
       batch = %{
-        "store_node_id" => "POS-07",
         "rows" => [customer_row("cust-1", %{"store_node_id" => "POS-99"})]
       }
 
       ingest(conn, batch)
 
-      assert Billing.get_by_client_id(:customer, "cust-1").store_node_id == "POS-07"
+      assert Billing.get_by_client_id(:customer, node.id, "cust-1").store_node_id == "POS-07"
     end
 
-    test "a raw customer_id in the payload is ignored", %{conn: conn} do
+    test "a raw customer_id in the payload is ignored", %{conn: conn, node: node} do
       other = Billing.create_customer!(%{name: "Someone Else", store_node_id: "POS-99"})
 
       batch = %{
-        "store_node_id" => "POS-07",
         "rows" => [
           item_row("item-1"),
           invoice_row("inv-1", %{
@@ -531,14 +672,14 @@ defmodule RealinvoiceCloudWeb.SyncIngestControllerTest do
 
       ingest(conn, batch)
 
-      assert is_nil(Billing.get_by_client_id(:invoice, "inv-1").customer_id)
+      assert is_nil(Billing.get_by_client_id(:invoice, node.id, "inv-1").customer_id)
     end
 
     test "an invoice naming an unknown customer_client_id is stored as a counter sale", %{
-      conn: conn
+      conn: conn,
+      node: node
     } do
       batch = %{
-        "store_node_id" => "POS-07",
         "rows" => [
           item_row("item-1"),
           invoice_row("inv-1", %{
@@ -549,37 +690,35 @@ defmodule RealinvoiceCloudWeb.SyncIngestControllerTest do
       }
 
       assert json_response(ingest(conn, batch), 200)["batch"]["rejected"] == 0
-      assert is_nil(Billing.get_by_client_id(:invoice, "inv-1").customer_id)
+      assert is_nil(Billing.get_by_client_id(:invoice, node.id, "inv-1").customer_id)
     end
   end
 
   describe "upserts" do
-    test "a customer re-sent with new details is updated in place", %{conn: conn} do
+    test "a customer re-sent with new details is updated in place", %{conn: conn, node: node} do
       ingest(conn, %{"store_node_id" => "POS-07", "rows" => [customer_row("cust-1")]})
 
       ingest(conn, %{
-        "store_node_id" => "POS-07",
         "rows" => [customer_row("cust-1", %{"name" => "Thiruvalluvar Networks Pvt Ltd"})]
       })
 
       assert Repo.aggregate(Billing.Customer, :count) == 1
 
-      assert Billing.get_by_client_id(:customer, "cust-1").name ==
+      assert Billing.get_by_client_id(:customer, node.id, "cust-1").name ==
                "Thiruvalluvar Networks Pvt Ltd"
     end
 
-    test "an item re-sent with a new price is updated in place", %{conn: conn} do
+    test "an item re-sent with a new price is updated in place", %{conn: conn, node: node} do
       ingest(conn, %{"store_node_id" => "POS-07", "rows" => [item_row("item-1")]})
 
       ingest(conn, %{
-        "store_node_id" => "POS-07",
         "rows" => [item_row("item-1", %{"rate" => "99000.00"})]
       })
 
       assert Repo.aggregate(Billing.Item, :count) == 1
 
       assert Decimal.equal?(
-               Billing.get_by_client_id(:item, "item-1").rate,
+               Billing.get_by_client_id(:item, node.id, "item-1").rate,
                Decimal.new("99000.00")
              )
     end
@@ -590,7 +729,6 @@ defmodule RealinvoiceCloudWeb.SyncIngestControllerTest do
       ingest(conn, full_batch())
 
       ingest(conn, %{
-        "store_node_id" => "POS-07",
         "rows" => [item_row("item-1", %{"rate" => "1.00"})]
       })
 

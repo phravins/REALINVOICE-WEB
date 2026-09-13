@@ -45,6 +45,7 @@ defmodule RealinvoiceCloud.Billing.Invoice do
     # A label sent by the desk (the cashier's name or local id). The cloud has
     # no local user accounts to resolve it against, so it is stored verbatim.
     field :created_by, :string
+    belongs_to :node, RealinvoiceCloud.Nodes.Node
     field :client_id, :string
 
     has_many :lines, RealinvoiceCloud.Billing.InvoiceLine, on_replace: :delete
@@ -68,7 +69,8 @@ defmodule RealinvoiceCloud.Billing.Invoice do
       :payment_type,
       :store_node_id,
       :created_by,
-      :client_id | @amount_fields
+      :client_id,
+      :node_id | @amount_fields
     ])
     |> cast_assoc(:lines, required: true)
     |> validate_required([:invoice_no, :date, :payment_type, :store_node_id | @amount_fields])
@@ -81,7 +83,7 @@ defmodule RealinvoiceCloud.Billing.Invoice do
     |> unique_constraint([:store_node_id, :invoice_no],
       message: "already exists for this billing desk"
     )
-    |> unique_constraint(:client_id)
+    |> unique_constraint([:node_id, :client_id])
   end
 
   defp validate_amounts(changeset) do

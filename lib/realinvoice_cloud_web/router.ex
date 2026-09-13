@@ -62,8 +62,7 @@ defmodule RealinvoiceCloudWeb.Router do
       live "/customers", CustomerLive.Index, :index
       live "/items", ItemLive.Index, :index
 
-      # Still a placeholder: desk enrolment arrives with the ingest API.
-      live "/nodes", SectionLive, :nodes
+      live "/nodes", NodeLive.Index, :index
 
       live "/settings", SettingsLive, :settings
 

@@ -9,7 +9,6 @@ defmodule RealinvoiceCloud.Sync do
   schema in `RealinvoiceCloud.Billing`:
 
       %{
-        "store_node_id" => "POS-01",
         "rows" => [
           %{"client_id" => "…", "type" => "customer", "data" => %{…}},
           %{"client_id" => "…", "type" => "item",     "data" => %{…}},
@@ -40,8 +39,13 @@ defmodule RealinvoiceCloud.Sync do
       lets the response say which rows were accepted and which were not.
     * **An invoice is one unit** with its lines: either the invoice and all of
       its lines land, or none of it does.
-    * **The desk cannot attribute rows to another desk.** `store_node_id` comes
-      from the batch envelope, and overwrites anything in a row.
+    * **The desk cannot attribute rows to another desk.** The desk is whichever
+      node's token authenticated the request; `store_node_id` is taken from that
+      node's name and overwrites anything in the payload. A node cannot claim to
+      be a different node than the token it presented.
+    * **Client ids are scoped to the node.** Two desks may generate the same
+      client id for unrelated rows, so the identity of a synced row is
+      (node, client_id) — never the client id alone.
 
   ## Ordering
 
@@ -53,8 +57,7 @@ defmodule RealinvoiceCloud.Sync do
   import Ecto.Query, warn: false
 
   alias RealinvoiceCloud.Billing
-  alias RealinvoiceCloud.Repo
-  alias RealinvoiceCloud.Sync.NodeClaim
+  alias RealinvoiceCloud.Nodes.Node
 
   require Logger
 
@@ -62,31 +65,26 @@ defmodule RealinvoiceCloud.Sync do
   @max_rows 1000
 
   @doc """
-  Processes one batch and returns a result for every row, in the order sent.
+  Processes one batch from an authenticated node, returning a result per row.
 
   Returns `{:ok, results}` for a well-formed batch — an individual row failing
   validation is an outcome to report, not an error for the batch. A batch that
   is not well formed at all returns `{:error, reason}`.
   """
-  def ingest_batch(store_node_id, rows)
+  def ingest_batch(node, rows)
 
-  def ingest_batch(store_node_id, _rows)
-      when not is_binary(store_node_id) or store_node_id == "" do
-    {:error, "store_node_id is required"}
-  end
-
-  def ingest_batch(_store_node_id, rows) when not is_list(rows) do
+  def ingest_batch(%Node{}, rows) when not is_list(rows) do
     {:error, "rows must be a list"}
   end
 
-  def ingest_batch(_store_node_id, rows) when length(rows) > @max_rows do
+  def ingest_batch(%Node{}, rows) when length(rows) > @max_rows do
     {:error, "a batch may carry at most #{@max_rows} rows"}
   end
 
-  def ingest_batch(store_node_id, rows) do
+  def ingest_batch(%Node{} = node, rows) do
     results =
       rows
-      |> Enum.map(&parse_row(&1, store_node_id))
+      |> Enum.map(&parse_row(&1, node))
       |> process_pass([:customer, :item])
       |> process_pass([:invoice])
       |> process_pass([:invoice_line])
@@ -100,7 +98,7 @@ defmodule RealinvoiceCloud.Sync do
   # Each row becomes a work item carrying either what to do or why it cannot be
   # done, so a malformed row is reported in its own place in the response
   # rather than aborting the batch.
-  defp parse_row(row, store_node_id) when is_map(row) do
+  defp parse_row(row, %Node{} = node) when is_map(row) do
     row = stringify(row)
     client_id = string_value(row, "client_id")
     type = string_value(row, "type")
@@ -125,24 +123,26 @@ defmodule RealinvoiceCloud.Sync do
           type: String.to_existing_atom(type),
           client_id: client_id,
           invoice_client_id: string_value(row, "invoice_client_id"),
-          data: prepare_data(data, store_node_id),
+          node: node,
+          data: prepare_data(data, node),
           error: nil
         }
     end
   end
 
-  defp parse_row(_row, _store_node_id),
+  defp parse_row(_row, _node),
     do: %{type: nil, client_id: nil, error: "each row must be an object"}
 
-  # The envelope's desk wins, and foreign keys are never taken from the wire:
+  # The authenticated node wins, and foreign keys are never taken from the wire:
   # a desk knows its own client ids, not this server's primary keys, so an
-  # incoming `customer_id` or `item_id` can only be a mistake or an attempt to
-  # attach a row to someone else's record.
-  defp prepare_data(data, store_node_id) do
+  # incoming `customer_id`, `item_id` or `node_id` can only be a mistake or an
+  # attempt to attach a row to someone else's record.
+  defp prepare_data(data, %Node{} = node) do
     data
     |> stringify()
-    |> Map.drop(["customer_id", "item_id", "invoice_id", "id"])
-    |> Map.put("store_node_id", store_node_id)
+    |> Map.drop(["customer_id", "item_id", "invoice_id", "node_id", "id"])
+    |> Map.put("store_node_id", node.name)
+    |> Map.put("node_id", node.id)
   end
 
   ## Processing
@@ -160,21 +160,21 @@ defmodule RealinvoiceCloud.Sync do
   end
 
   defp process(%{type: :customer} = item, _items) do
-    case Billing.get_by_client_id(:customer, item.client_id) do
+    case Billing.get_by_client_id(:customer, item.node.id, item.client_id) do
       nil -> put_outcome(item, Billing.upsert_customer(nil, with_client_id(item)), :inserted)
       existing -> put_outcome(item, Billing.upsert_customer(existing, item.data), :updated)
     end
   end
 
   defp process(%{type: :item} = item, _items) do
-    case Billing.get_by_client_id(:item, item.client_id) do
+    case Billing.get_by_client_id(:item, item.node.id, item.client_id) do
       nil -> put_outcome(item, Billing.upsert_item(nil, with_client_id(item)), :inserted)
       existing -> put_outcome(item, Billing.upsert_item(existing, item.data), :updated)
     end
   end
 
   defp process(%{type: :invoice} = item, items) do
-    case Billing.get_by_client_id(:invoice, item.client_id) do
+    case Billing.get_by_client_id(:invoice, item.node.id, item.client_id) do
       # Append-only: an invoice already here is never rewritten, however many
       # times a desk sends it.
       %{} = existing ->
@@ -201,7 +201,8 @@ defmodule RealinvoiceCloud.Sync do
       )
 
     stored_line =
-      item.invoice_client_id && Billing.get_by_client_id(:invoice_line, item.client_id)
+      item.invoice_client_id &&
+        Billing.get_by_client_id(:invoice_line, item.node.id, item.client_id)
 
     cond do
       is_nil(item.invoice_client_id) ->
@@ -212,7 +213,7 @@ defmodule RealinvoiceCloud.Sync do
           {:ok, _invoice} ->
             # Report the line's own id, not its invoice's — the worker asked
             # about this row.
-            case Billing.get_by_client_id(:invoice_line, item.client_id) do
+            case Billing.get_by_client_id(:invoice_line, item.node.id, item.client_id) do
               nil -> %{item | error: "its invoice was accepted without this line"}
               line -> put_outcome(item, {:ok, line}, invoice_item[:action])
             end
@@ -246,31 +247,31 @@ defmodule RealinvoiceCloud.Sync do
       )
       |> Enum.map(&Map.put(&1.data, "client_id", &1.client_id))
 
-    Enum.map(nested ++ standalone, &resolve_item/1)
+    Enum.map(nested ++ standalone, &resolve_item(&1, invoice_item.node))
   end
 
-  # Lines name their item by the desk's client id.
-  defp resolve_item(line) do
+  # Lines name their item by the desk's client id, resolved within that desk.
+  defp resolve_item(line, %Node{} = node) do
     case string_value(line, "item_client_id") do
       nil ->
         line
 
       item_client_id ->
-        case Billing.get_by_client_id(:item, item_client_id) do
+        case Billing.get_by_client_id(:item, node.id, item_client_id) do
           nil -> line
           item -> Map.put(line, "item_id", item.id)
         end
     end
   end
 
-  # Invoices name their customer by the desk's client id.
+  # Invoices name their customer by the desk's client id, within that desk.
   defp resolve_customer(attrs, item) do
     case string_value(item.data, "customer_client_id") do
       nil ->
         attrs
 
       customer_client_id ->
-        case Billing.get_by_client_id(:customer, customer_client_id) do
+        case Billing.get_by_client_id(:customer, item.node.id, customer_client_id) do
           nil -> attrs
           customer -> Map.put(attrs, "customer_id", customer.id)
         end
@@ -322,52 +323,6 @@ defmodule RealinvoiceCloud.Sync do
         opts |> Keyword.get(String.to_existing_atom(key), key) |> to_string()
       end)
     end)
-  end
-
-  ## Token claims
-
-  @doc """
-  Records that `store_node_id` presented this token, and how much it sent.
-
-  Deliberately not an authorisation check — see `RealinvoiceCloud.Sync.NodeClaim`.
-  Failing to record a claim never fails an otherwise good batch.
-  """
-  def record_claim(store_node_id, token, row_count) do
-    now = DateTime.utc_now(:second)
-
-    %NodeClaim{}
-    |> NodeClaim.changeset(%{
-      store_node_id: store_node_id,
-      token_digest: NodeClaim.digest(token),
-      batch_count: 1,
-      row_count: row_count,
-      first_claimed_at: now,
-      last_seen_at: now
-    })
-    |> Repo.insert(
-      on_conflict: [
-        inc: [batch_count: 1, row_count: row_count],
-        set: [last_seen_at: now, updated_at: now]
-      ],
-      conflict_target: [:store_node_id, :token_digest]
-    )
-    |> case do
-      {:ok, claim} ->
-        {:ok, claim}
-
-      {:error, reason} ->
-        Logger.warning("could not record sync claim for #{store_node_id}: #{inspect(reason)}")
-        :error
-    end
-  end
-
-  @doc """
-  Lists the desks that have presented a token, most recently seen first.
-  """
-  def list_node_claims do
-    NodeClaim
-    |> order_by([c], desc: c.last_seen_at)
-    |> Repo.all()
   end
 
   ## Helpers
