@@ -52,7 +52,7 @@ Production reads `DATABASE_URL` and `SECRET_KEY_BASE` at runtime
 
 ## Data model
 
-Four tables mirror the desktop app's core data model, all under the
+Six tables mirror the desktop app's core data model, all under the
 `RealinvoiceCloud.Billing` context:
 
 | | |
@@ -61,6 +61,8 @@ Four tables mirror the desktop app's core data model, all under the
 | `items` | code, description, rate, tax rate, UOM |
 | `invoices` | number, date, customer, subtotal, CGST/SGST/IGST, grand total, payment type, `created_by` |
 | `invoice_lines` | item, quantity, rate, tax rate, line total |
+| `credit_notes` | number, date, original invoice, reason, subtotal, CGST/SGST/IGST, grand total, `created_by` |
+| `credit_note_lines` | item, quantity, rate, tax rate, line total |
 
 Every row carries a `store_node_id` — the billing desk it came from. Two things
 follow from that, and both are enforced by the schema:
@@ -85,17 +87,51 @@ invoices. Such an invoice shows as "Counter sale".
 cashier accounts, so it stores whatever the desk sends rather than resolving it
 to a user.
 
+### Credit notes
+
+A credit note corrects an invoice the desk has already issued. It is a separate
+document, not an edit: invoices stay append-only, and what an invoice is worth
+today is its grand total less the credit notes raised against it.
+
+Three decisions are worth knowing, because the rest of the app depends on them:
+
+  * **Its figures are stored positive.** A credit note subtracts because of what
+    it is, not because its numbers are negative. Netting is subtraction at the
+    point of use (`Billing.net_total/1`), so nothing depends on the desk having
+    remembered to send a minus sign.
+  * **It counts on its own date, not the invoice's.** An invoice from the 1st
+    credited on the 14th reduces the 14th's takings. Dating it back would restate
+    a day that has already been reported on, which is exactly what a credit note
+    exists to avoid.
+  * **It must name an invoice this server holds.** `original_invoice_id` is
+    `NOT NULL` and ingest rejects a note whose invoice it cannot resolve. An
+    unlinked credit note would sit in the database quietly netting nothing off
+    anything, which is worse than a rejection the worker can retry.
+
+The list and detail queries carry the aggregates as virtual fields
+(`credit_note_count`, `credited_total`) via one left-joined subquery, so a page
+of invoices costs one query rather than one per row. `Billing.net_total/1`,
+`credited_total/1` and `credited?/1` read them.
+
+Where this shows up in the UI: a **Credits** column and an **Any / Corrected /
+Not corrected** filter on the Invoices list, a **Net after credits** line and the
+notes themselves on an invoice's page, and a Dashboard whose revenue figures are
+net, with "₹X billed less ₹Y credited" spelled out underneath so the netting is
+visible rather than silent.
+
 ### Live updates
 
-`Billing.create_invoice/1` broadcasts on `"billing:invoices"`, and the invoice
-list and dashboard subscribe. Ingest calls that function, so a synced invoice
-appears in an open browser without a refresh.
+`Billing.create_invoice/1` and `create_credit_note/1` broadcast on
+`"billing:invoices"`, and the invoice list, invoice detail page and dashboard
+subscribe. Ingest calls those functions, so a synced invoice — or a credit note
+against an invoice already on screen — appears without a refresh.
 
 ## Sample data
 
-`mix run priv/repo/seeds.exs` creates 3 customers, 6 items and 13 invoices
-across two desks (`POS-01`, `POS-02`) and a spread of dates in the current
-month. It is deterministic — the same figures on every machine — and idempotent.
+`mix run priv/repo/seeds.exs` creates 3 customers, 6 items, 13 invoices and 3
+credit notes across two desks (`POS-01`, `POS-02`) and a spread of dates in the
+current month. Two of the credit notes are dated today, so the dashboard's
+"revenue today" is visibly net of them. It is deterministic — the same figures on every machine — and idempotent.
 To rebuild it from scratch:
 
 ```sh
@@ -146,6 +182,17 @@ Content-Type: application/json
                 "payment_type": "UPI", "created_by": "Anitha R (till-1)",
                 "lines": [ { "client_id": "l-1", "item_client_id": "i-41b7",
                              "qty": "1", "rate": "48500.00", "tax_rate": "18.00",
+                             "line_total": "48500.00" } ] } },
+
+    { "client_id": "cn-3d90", "type": "credit_note",
+      "data": { "credit_note_no": "CN-2026-0001", "date": "2026-09-14",
+                "original_invoice_client_id": "v-77c1",
+                "reason": "Returned unopened",
+                "subtotal": "48500.00", "cgst": "4365.00", "sgst": "4365.00",
+                "igst": "0.00", "grand_total": "57230.00",
+                "created_by": "Anitha R (till-1)",
+                "lines": [ { "client_id": "cnl-1", "item_client_id": "i-41b7",
+                             "qty": "1", "rate": "48500.00", "tax_rate": "18.00",
                              "line_total": "48500.00" } ] } }
   ]
 }
@@ -154,15 +201,23 @@ Content-Type: application/json
   * `client_id` is the desk's own identifier for the row — any string, stable
     forever, never reused. **This is what makes ingest idempotent**: a retried
     batch finds what it already wrote instead of inserting it again.
-  * `type` is one of `customer`, `item`, `invoice`, `invoice_line`.
+  * `type` is one of `customer`, `item`, `invoice`, `invoice_line`,
+    `credit_note`, `credit_note_line`.
   * Invoices name their customer with `customer_client_id`, and lines name their
     item with `item_client_id` — the desk's identifiers, which the server
     translates to its own primary keys. A desk never sends this server's ids.
   * Lines may be **nested** in the invoice's `lines` (above) or sent as their own
     `invoice_line` rows carrying `"invoice_client_id": "v-77c1"`. Both work; send
-    whichever suits the worker.
+    whichever suits the worker. Credit note lines work the same way, nested or as
+    `credit_note_line` rows carrying `"credit_note_client_id": "cn-3d90"`.
+  * A credit note names the invoice it corrects with
+    `original_invoice_client_id` — the invoice may be in the same batch (as
+    above) or one this server already holds. A note whose invoice cannot be
+    resolved is rejected, never stored unlinked.
+  * Credit note figures are sent **positive**, exactly as the document reads. The
+    server subtracts them where it reports; it does not expect a minus sign.
   * Rows may arrive in any order — the server processes customers and items
-    first, then invoices, then standalone lines.
+    first, then invoices, then their lines, then credit notes and theirs.
   * **The desk is whichever node's token authenticated the request.** There is no
     `store_node_id` in the payload — it comes from the node's name. A desk cannot
     claim to be another desk, and a `store_node_id` sent anyway is ignored (and
@@ -203,12 +258,16 @@ a list, more than 1000 rows).
     same ids. A row's identity is (node, `client_id`) — client ids are generated
     by a desk and are only unique within it, so two desks may use the same id for
     unrelated rows without colliding.
-  * **Invoices are append-only.** Once stored, an invoice is never rewritten,
-    whatever a later batch says — a re-sent invoice comes back `unchanged`.
+  * **Invoices and credit notes are append-only.** Once stored, neither is ever
+    rewritten, whatever a later batch says — a re-sent one comes back
+    `unchanged`, so a retried credit note cannot be counted twice. A desk that
+    needs to correct an invoice issues a credit note; one that needs to correct a
+    credit note issues another document, it does not amend the one already sent.
     Customers and items are upserted, last write wins.
   * **A row fails on its own.** Each unit is its own transaction, so one invalid
     row does not roll back the rest of the batch. An invoice and its lines are a
-    single unit: all of it lands or none of it does.
+    single unit, as are a credit note and its lines: all of it lands or none of
+    it does.
 
 ### Trying it
 
@@ -340,7 +399,8 @@ browser and defaults to the operating system setting.
 ```
 lib/realinvoice_cloud/accounts/        auth context, user schema, tokens, login throttle
 lib/realinvoice_cloud/billing.ex       queries, filters, dashboard figures, PubSub
-lib/realinvoice_cloud/billing/         customer, item, invoice, invoice_line
+lib/realinvoice_cloud/billing/         customer, item, invoice, invoice_line,
+                                       credit_note, credit_note_line
 lib/realinvoice_cloud/sync.ex          batch ingest: idempotency, per-row results
 lib/realinvoice_cloud/nodes.ex         registering desks, authenticating tokens
 lib/realinvoice_cloud/nodes/           the node schema
@@ -353,7 +413,7 @@ lib/realinvoice_cloud_web/controllers/
 lib/realinvoice_cloud_web/plugs/
   require_sync_token.ex                resolves a token to an active node
 lib/realinvoice_cloud_web/live/
-  dashboard_live.ex                    today's revenue, counts, revenue by desk
+  dashboard_live.ex                    revenue net of credits, counts, revenue by desk
   invoice_live/                        invoice list (filters, live updates) and detail
   customer_live/                       customer list
   item_live/                           catalogue list

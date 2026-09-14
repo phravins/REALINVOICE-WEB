@@ -14,13 +14,23 @@ defmodule RealinvoiceCloud.Sync do
           %{"client_id" => "…", "type" => "item",     "data" => %{…}},
           %{"client_id" => "…", "type" => "invoice",  "data" => %{…, "lines" => [%{…}]}},
           %{"client_id" => "…", "type" => "invoice_line",
-            "invoice_client_id" => "…", "data" => %{…}}
+            "invoice_client_id" => "…", "data" => %{…}},
+          %{"client_id" => "…", "type" => "credit_note",
+            "data" => %{…, "original_invoice_client_id" => "…", "lines" => [%{…}]}},
+          %{"client_id" => "…", "type" => "credit_note_line",
+            "credit_note_client_id" => "…", "data" => %{…}}
         ]
       }
 
   Invoice lines may arrive either nested inside their invoice's `lines`, or as
   separate rows naming their invoice with `invoice_client_id`. Both end up in
-  the same place, so a desk can send whichever suits its worker.
+  the same place, so a desk can send whichever suits its worker. Credit note
+  lines work identically, naming their note with `credit_note_client_id`.
+
+  A credit note names the invoice it corrects with `original_invoice_client_id`.
+  That invoice must either be in the same batch or already stored; a credit note
+  with nothing to credit is rejected rather than stored unlinked, because an
+  unlinked credit would silently stop netting off anything.
 
   An invoice names its customer with `customer_client_id` and each line names
   its item with `item_client_id` — the desk's own identifiers, which this server
@@ -31,9 +41,9 @@ defmodule RealinvoiceCloud.Sync do
 
     * **Idempotent.** Every row is looked up by `client_id` first. A retried
       batch reports what it already wrote and changes nothing.
-    * **Invoices are append-only.** An invoice already stored is never updated,
-      whatever a later batch says. Customers and items are upserted, last write
-      wins.
+    * **Invoices and credit notes are append-only.** One already stored is never
+      updated, whatever a later batch says. Customers and items are upserted,
+      last write wins.
     * **A row fails on its own.** Each unit of work is its own transaction, so
       one invalid row does not roll back the rest of the batch. That is what
       lets the response say which rows were accepted and which were not.
@@ -50,8 +60,9 @@ defmodule RealinvoiceCloud.Sync do
   ## Ordering
 
   Rows are processed in type order — customers and items, then invoices, then
-  standalone invoice lines — whatever order they arrive in, because an invoice
-  refers to the first two. A desk does not have to sort its batch.
+  standalone invoice lines, then credit notes and their lines — whatever order
+  they arrive in, because each stage refers to the ones before it. A desk does
+  not have to sort its batch.
   """
 
   import Ecto.Query, warn: false
@@ -61,7 +72,7 @@ defmodule RealinvoiceCloud.Sync do
 
   require Logger
 
-  @row_types ~w(customer item invoice invoice_line)
+  @row_types ~w(customer item invoice invoice_line credit_note credit_note_line)
   @max_rows 1000
 
   @doc """
@@ -88,6 +99,8 @@ defmodule RealinvoiceCloud.Sync do
       |> process_pass([:customer, :item])
       |> process_pass([:invoice])
       |> process_pass([:invoice_line])
+      |> process_pass([:credit_note])
+      |> process_pass([:credit_note_line])
       |> Enum.map(&to_result/1)
 
     {:ok, results}
@@ -123,6 +136,7 @@ defmodule RealinvoiceCloud.Sync do
           type: String.to_existing_atom(type),
           client_id: client_id,
           invoice_client_id: string_value(row, "invoice_client_id"),
+          credit_note_client_id: string_value(row, "credit_note_client_id"),
           node: node,
           data: prepare_data(data, node),
           error: nil
@@ -140,7 +154,15 @@ defmodule RealinvoiceCloud.Sync do
   defp prepare_data(data, %Node{} = node) do
     data
     |> stringify()
-    |> Map.drop(["customer_id", "item_id", "invoice_id", "node_id", "id"])
+    |> Map.drop([
+      "customer_id",
+      "item_id",
+      "invoice_id",
+      "credit_note_id",
+      "original_invoice_id",
+      "node_id",
+      "id"
+    ])
     |> Map.put("store_node_id", node.name)
     |> Map.put("node_id", node.id)
   end
@@ -191,50 +213,86 @@ defmodule RealinvoiceCloud.Sync do
     end
   end
 
-  # A line sent as its own row is applied as part of its invoice, so all that
-  # happens here is reporting what became of it.
-  defp process(%{type: :invoice_line} = item, items) do
-    invoice_item =
-      Enum.find(
-        items,
-        &(&1[:type] == :invoice and &1[:client_id] == item.invoice_client_id)
-      )
+  defp process(%{type: :credit_note} = item, items) do
+    case Billing.get_by_client_id(:credit_note, item.node.id, item.client_id) do
+      # Append-only, for the same reason invoices are.
+      %{} = existing ->
+        put_outcome(item, {:ok, existing}, :unchanged)
 
-    stored_line =
-      item.invoice_client_id &&
-        Billing.get_by_client_id(:invoice_line, item.node.id, item.client_id)
+      nil ->
+        case resolve_original_invoice(item, items) do
+          {:ok, invoice_id} ->
+            attrs =
+              item
+              |> with_client_id()
+              |> Map.put("lines", lines_for(item, items, :credit_note_line))
+              |> Map.put("original_invoice_id", invoice_id)
 
-    cond do
-      is_nil(item.invoice_client_id) ->
-        %{item | error: "invoice_client_id is required for an invoice_line row"}
+            put_outcome(item, Billing.create_credit_note(attrs), :inserted)
 
-      invoice_item ->
-        case invoice_item[:outcome] do
-          {:ok, _invoice} ->
-            # Report the line's own id, not its invoice's — the worker asked
-            # about this row.
-            case Billing.get_by_client_id(:invoice_line, item.node.id, item.client_id) do
-              nil -> %{item | error: "its invoice was accepted without this line"}
-              line -> put_outcome(item, {:ok, line}, invoice_item[:action])
-            end
-
-          _rejected ->
-            %{item | error: "its invoice was rejected"}
+          {:error, reason} ->
+            %{item | error: reason}
         end
-
-      stored_line ->
-        # A retry of a line whose invoice landed in an earlier batch.
-        put_outcome(item, {:ok, stored_line}, :unchanged)
-
-      true ->
-        %{item | error: "no invoice in this batch or already stored for invoice_client_id"}
     end
   end
 
-  # Lines nested inside the invoice, plus any sent as their own rows naming it.
-  defp lines_for(invoice_item, items) do
+  # A line sent as its own row is applied as part of its parent document, so all
+  # that happens here is reporting what became of it.
+  defp process(%{type: :invoice_line} = item, items),
+    do: process_line(item, items, :invoice, :invoice_line, item.invoice_client_id)
+
+  defp process(%{type: :credit_note_line} = item, items),
+    do: process_line(item, items, :credit_note, :credit_note_line, item.credit_note_client_id)
+
+  defp process_line(item, items, parent_type, line_type, parent_client_id) do
+    parent_key = "#{parent_type}_client_id"
+
+    parent_item =
+      Enum.find(items, &(&1[:type] == parent_type and &1[:client_id] == parent_client_id))
+
+    stored_line =
+      parent_client_id && Billing.get_by_client_id(line_type, item.node.id, item.client_id)
+
+    cond do
+      is_nil(parent_client_id) ->
+        %{item | error: "#{parent_key} is required for #{article(line_type)} #{line_type} row"}
+
+      parent_item ->
+        case parent_item[:outcome] do
+          {:ok, _parent} ->
+            # Report the line's own id, not its parent's — the worker asked
+            # about this row.
+            case Billing.get_by_client_id(line_type, item.node.id, item.client_id) do
+              nil -> %{item | error: "its #{parent_type} was accepted without this line"}
+              line -> put_outcome(item, {:ok, line}, parent_item[:action])
+            end
+
+          _rejected ->
+            %{item | error: "its #{parent_type} was rejected"}
+        end
+
+      stored_line ->
+        # A retry of a line whose parent landed in an earlier batch.
+        put_outcome(item, {:ok, stored_line}, :unchanged)
+
+      true ->
+        %{item | error: "no #{parent_type} in this batch or already stored for #{parent_key}"}
+    end
+  end
+
+  # "an invoice_line", but "a credit_note_line" — the row type is part of the
+  # sentence the worker's operator reads, so it should read like one.
+  defp article(type) do
+    if String.first(to_string(type)) in ~w(a e i o u), do: "an", else: "a"
+  end
+
+  # Lines nested inside the document, plus any sent as their own rows naming it.
+  defp lines_for(parent_item, items, line_type \\ :invoice_line) do
+    parent_key =
+      if line_type == :credit_note_line, do: :credit_note_client_id, else: :invoice_client_id
+
     nested =
-      invoice_item.data
+      parent_item.data
       |> Map.get("lines", [])
       |> List.wrap()
       |> Enum.map(&stringify/1)
@@ -242,12 +300,41 @@ defmodule RealinvoiceCloud.Sync do
     standalone =
       items
       |> Enum.filter(
-        &(&1[:type] == :invoice_line and &1[:invoice_client_id] == invoice_item.client_id and
+        &(&1[:type] == line_type and &1[parent_key] == parent_item.client_id and
             is_nil(&1[:error]))
       )
       |> Enum.map(&Map.put(&1.data, "client_id", &1.client_id))
 
-    Enum.map(nested ++ standalone, &resolve_item(&1, invoice_item.node))
+    Enum.map(nested ++ standalone, &resolve_item(&1, parent_item.node))
+  end
+
+  # A credit note has to name an invoice that exists, in this batch or already
+  # stored. Storing one unlinked would leave a credit that nets off nothing.
+  defp resolve_original_invoice(item, items) do
+    case string_value(item.data, "original_invoice_client_id") do
+      nil ->
+        {:error, "original_invoice_client_id is required for a credit_note row"}
+
+      invoice_client_id ->
+        batch_invoice =
+          Enum.find(items, &(&1[:type] == :invoice and &1[:client_id] == invoice_client_id))
+
+        stored = Billing.get_by_client_id(:invoice, item.node.id, invoice_client_id)
+
+        cond do
+          match?({:ok, _}, batch_invoice[:outcome]) ->
+            {:ok, elem(batch_invoice[:outcome], 1).id}
+
+          batch_invoice ->
+            {:error, "its original invoice was rejected"}
+
+          stored ->
+            {:ok, stored.id}
+
+          true ->
+            {:error, "no invoice in this batch or already stored for original_invoice_client_id"}
+        end
+    end
   end
 
   # Lines name their item by the desk's client id, resolved within that desk.

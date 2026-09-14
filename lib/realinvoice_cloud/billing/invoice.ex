@@ -49,6 +49,13 @@ defmodule RealinvoiceCloud.Billing.Invoice do
     field :client_id, :string
 
     has_many :lines, RealinvoiceCloud.Billing.InvoiceLine, on_replace: :delete
+    has_many :credit_notes, RealinvoiceCloud.Billing.CreditNote, foreign_key: :original_invoice_id
+
+    # Filled in by the list and detail queries so a page can show what has been
+    # credited without a query per row. Not columns: they are derived, and
+    # storing them would be one more thing to keep in step with reality.
+    field :credit_note_count, :integer, virtual: true, default: 0
+    field :credited_total, :decimal, virtual: true, default: Decimal.new("0.00")
 
     timestamps(type: :utc_datetime)
   end

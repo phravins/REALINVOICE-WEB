@@ -31,8 +31,9 @@ the generated Phoenix guidance below:
   never reorder that, or a correct password would slip past an active block.
   A success clears the email's failures only, never the IP's.
 - **The billing data model lives in `RealinvoiceCloud.Billing`** (customers,
-  items, invoices, invoice lines). Every row carries a `store_node_id`; invoice
-  numbers and item codes are unique *per desk*, not globally.
+  items, invoices, invoice lines, credit notes, credit note lines). Every row
+  carries a `store_node_id`; invoice, credit note numbers and item codes are
+  unique *per desk*, not globally.
 - **Never recompute a desk's GST figures.** Subtotal, CGST/SGST/IGST and grand
   total are stored exactly as the desk sent them. Validations check integrity,
   not arithmetic.
@@ -56,8 +57,22 @@ the generated Phoenix guidance below:
   tenant.
 - The identity of a synced row is **(node_id, client_id)**, never client_id
   alone — client ids are only unique within the desk that generated them.
-- Ingest goes through `Billing.create_invoice/1`, which broadcasts. Anything
-  that writes invoices should go through it too, or the live screens go quiet.
+- Ingest goes through `Billing.create_invoice/1` and `create_credit_note/1`,
+  which broadcast. Anything that writes invoices or credit notes should go
+  through them too, or the live screens go quiet.
+- **A credit note corrects an invoice; it never edits one.** Its figures are
+  stored *positive* and subtracted where they are reported — do not persuade the
+  schema to hold negatives. It counts against **its own date**, not the
+  invoice's, so a correction never restates a day already reported on. And it
+  must resolve to a stored invoice: `original_invoice_id` is `NOT NULL` and
+  ingest rejects an unlinkable note rather than storing one that nets off
+  nothing.
+- **No figure the back office reports may be gross once credits exist.** The
+  dashboard, the invoice list and the invoice page all show net, with the gross
+  and the credited amount alongside so the netting is visible. If you add a
+  revenue figure anywhere, net it — `Billing.net_total/1` and the
+  `credit_note_count` / `credited_total` virtual fields (one left-joined
+  subquery in `with_credit_totals/1`, not a query per row) are there for it.
 
 ## Project guidelines
 

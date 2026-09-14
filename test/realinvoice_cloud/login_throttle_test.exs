@@ -6,7 +6,7 @@ defmodule RealinvoiceCloud.Accounts.LoginThrottleTest do
 
   @ip "203.0.113.10"
 
-  defp fail(email, ip \\ @ip, times \\ 1) do
+  defp fail(email, ip, times \\ 1) do
     for _ <- 1..times, do: LoginThrottle.record_failure(email, ip)
     :ok
   end
