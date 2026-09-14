@@ -28,6 +28,18 @@ defmodule RealinvoiceCloudWeb.UserLive.Login do
         </p>
       </div>
 
+      <div
+        :if={@too_many_attempts}
+        id="too-many-attempts"
+        role="alert"
+        class="mb-6 rounded-md border border-destructive/40 bg-destructive/5 px-4 py-3"
+      >
+        <p class="flex items-center gap-1.5 text-sm font-medium text-destructive">
+          <span class="hero-exclamation-triangle-mini size-4 bg-destructive" /> Too many attempts
+        </p>
+        <p class="mt-1 text-sm text-muted-foreground">{@too_many_attempts}</p>
+      </div>
+
       <.form
         :let={f}
         for={@form}
@@ -131,7 +143,13 @@ defmodule RealinvoiceCloudWeb.UserLive.Login do
 
     form = to_form(%{"email" => email}, as: "user")
 
-    {:ok, assign(socket, form: form, trigger_submit: false, page_title: "Sign in")}
+    {:ok,
+     socket
+     |> assign(form: form, trigger_submit: false, page_title: "Sign in")
+     # Set by UserSessionController when a limit refused the attempt. Shown
+     # inline rather than as a passing toast: it explains why a correct
+     # password is being turned away, which the generic error would not.
+     |> assign(:too_many_attempts, Phoenix.Flash.get(socket.assigns.flash, :too_many_attempts))}
   end
 
   @impl true

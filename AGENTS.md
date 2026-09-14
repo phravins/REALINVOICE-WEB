@@ -25,6 +25,11 @@ the generated Phoenix guidance below:
 - **There is no public registration.** Accounts are provisioned by
   `priv/repo/seeds.exs` via `Accounts.create_staff_user/1`. Do not add a
   `/users/register` route.
+- **Password sign-ins are rate limited** by `Accounts.LoginThrottle` — 5
+  failures per email and 20 per IP over a sliding 15-minute window, counted in
+  `failed_login_attempts`. The check runs *before* the password is verified;
+  never reorder that, or a correct password would slip past an active block.
+  A success clears the email's failures only, never the IP's.
 - **The billing data model lives in `RealinvoiceCloud.Billing`** (customers,
   items, invoices, invoice lines). Every row carries a `store_node_id`; invoice
   numbers and item codes are unique *per desk*, not globally.

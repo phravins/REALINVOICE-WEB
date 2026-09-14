@@ -271,6 +271,53 @@ migration.
 Back-office accounts are entirely separate from the cashier logins on each
 billing desk; the two never share credentials.
 
+### Sign-in rate limiting
+
+Failed password sign-ins are counted in `failed_login_attempts` over a sliding
+15-minute window, with two independent limits:
+
+| Scope | Limit | Stops |
+|---|---|---|
+| Email | 5 failures | working a password list against one known address |
+| IP | 20 failures | spraying one password across many addresses from one machine |
+
+Either limit refuses the attempt, and the check runs **before** the password is
+verified — a correct password offered while blocked is still turned away, which
+is the whole point. The login screen shows a distinct "Too many attempts"
+message saying roughly how long is left, rather than the usual invalid-
+credentials error.
+
+A successful sign-in clears that email's failures, but never the IP's — otherwise
+anyone holding one valid account could reset the per-IP limit between bursts.
+Failures are recorded for addresses with no account too, so being blocked reveals
+nothing about who has an account.
+
+Every lockout and every attempt made *while* blocked is logged at warning level
+under `[login-throttle]`, which is the signal worth alerting on: someone who has
+forgotten their password stops, a script does not. The table keeps 24 hours of
+history — longer than the counting window — so a run of lockouts can be read back
+afterwards.
+
+Limits are configurable:
+
+```elixir
+config :realinvoice_cloud, RealinvoiceCloud.Accounts.LoginThrottle,
+  max_failures_per_email: 5,
+  max_failures_per_ip: 20,
+  window_minutes: 15,
+  retention_hours: 24
+```
+
+> **Behind a proxy**, `conn.remote_ip` is the proxy's address and the per-IP limit
+> would fire for everyone at once. Such a deployment needs `RemoteIp` configured
+> with its *trusted* proxy ranges. `x-forwarded-for` is deliberately not read
+> here — it is caller-supplied, so trusting it blindly would let an attacker
+> defeat the per-IP limit with a header.
+
+The emailed sign-in link is not rate limited by this: it proves control of the
+mailbox rather than guessing a secret, and blocking it would lock out the person
+trying to recover. Throttling *requests* for those links is a separate job.
+
 Signed-in users can change their own email and password at `/users/settings`.
 Forgotten passwords are handled by the "email me a link" option on the login
 page, which signs you in so you can set a new one.
@@ -291,7 +338,7 @@ browser and defaults to the operating system setting.
 ## Layout of the code
 
 ```
-lib/realinvoice_cloud/accounts/        auth context, user schema and tokens
+lib/realinvoice_cloud/accounts/        auth context, user schema, tokens, login throttle
 lib/realinvoice_cloud/billing.ex       queries, filters, dashboard figures, PubSub
 lib/realinvoice_cloud/billing/         customer, item, invoice, invoice_line
 lib/realinvoice_cloud/sync.ex          batch ingest: idempotency, per-row results
