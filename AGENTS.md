@@ -25,9 +25,15 @@ the generated Phoenix guidance below:
 - **There is no public registration.** Accounts are provisioned by
   `priv/repo/seeds.exs` via `Accounts.create_staff_user/1`. Do not add a
   `/users/register` route.
+- **Password sign-ins are rate limited** by `Accounts.LoginThrottle` — 5
+  failures per email and 20 per IP over a sliding 15-minute window, counted in
+  `failed_login_attempts`. The check runs *before* the password is verified;
+  never reorder that, or a correct password would slip past an active block.
+  A success clears the email's failures only, never the IP's.
 - **The billing data model lives in `RealinvoiceCloud.Billing`** (customers,
-  items, invoices, invoice lines). Every row carries a `store_node_id`; invoice
-  numbers and item codes are unique *per desk*, not globally.
+  items, invoices, invoice lines, credit notes, credit note lines). Every row
+  carries a `store_node_id`; invoice, credit note numbers and item codes are
+  unique *per desk*, not globally.
 - **Never recompute a desk's GST figures.** Subtotal, CGST/SGST/IGST and grand
   total are stored exactly as the desk sent them. Validations check integrity,
   not arithmetic.
@@ -36,9 +42,37 @@ the generated Phoenix guidance below:
 - The billing tables are **read-only from the back office**: no create, update or
   delete UI or context functions, because who owns editing this data — cloud or
   desk — is not yet decided. Do not add one on a guess.
-- Do not build the ingest API or sync logic yet — that waits for the desktop
-  app's sync worker. `Billing.create_invoice/1` and its PubSub broadcast are the
-  seam it will plug into.
+- **Ingest lives in `RealinvoiceCloud.Sync`**, behind `POST /api/sync/ingest`.
+  Its rules — idempotency by the desk's `client_id`, append-only invoices,
+  upserted customers/items, one transaction per row so a bad row does not sink
+  the batch — are documented in that module and in the README. Do not weaken
+  them.
+- **Ingest is authenticated by per-node API tokens** (`RealinvoiceCloud.Nodes`).
+  A token is hashed with SHA-256 and looked up against *active* nodes only;
+  anything else is a 401. There is no fallback — never reintroduce one.
+- A node token is shown once at registration and only its hash is stored. There
+  is deliberately no way to display it again; do not add one.
+- **Multi-tenancy is still deferred.** `nodes.tenant_id` exists and is indexed
+  but nothing populates or filters on it. A token is scoped to a desk, not a
+  tenant.
+- The identity of a synced row is **(node_id, client_id)**, never client_id
+  alone — client ids are only unique within the desk that generated them.
+- Ingest goes through `Billing.create_invoice/1` and `create_credit_note/1`,
+  which broadcast. Anything that writes invoices or credit notes should go
+  through them too, or the live screens go quiet.
+- **A credit note corrects an invoice; it never edits one.** Its figures are
+  stored *positive* and subtracted where they are reported — do not persuade the
+  schema to hold negatives. It counts against **its own date**, not the
+  invoice's, so a correction never restates a day already reported on. And it
+  must resolve to a stored invoice: `original_invoice_id` is `NOT NULL` and
+  ingest rejects an unlinkable note rather than storing one that nets off
+  nothing.
+- **No figure the back office reports may be gross once credits exist.** The
+  dashboard, the invoice list and the invoice page all show net, with the gross
+  and the credited amount alongside so the netting is visible. If you add a
+  revenue figure anywhere, net it — `Billing.net_total/1` and the
+  `credit_note_count` / `credited_total` virtual fields (one left-joined
+  subquery in `with_credit_totals/1`, not a query per row) are there for it.
 
 ## Project guidelines
 

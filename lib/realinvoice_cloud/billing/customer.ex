@@ -22,6 +22,11 @@ defmodule RealinvoiceCloud.Billing.Customer do
     field :mobile, :string
     field :store_node_id, :string
 
+    # Identity of a synced row: the desk it came from, plus the id that desk
+    # generated for it. Unique together — see the migration.
+    belongs_to :node, RealinvoiceCloud.Nodes.Node
+    field :client_id, :string
+
     has_many :invoices, RealinvoiceCloud.Billing.Invoice
 
     timestamps(type: :utc_datetime)
@@ -35,13 +40,22 @@ defmodule RealinvoiceCloud.Billing.Customer do
   """
   def changeset(customer, attrs) do
     customer
-    |> cast(attrs, [:name, :gstin, :place_of_supply, :mobile, :store_node_id])
+    |> cast(attrs, [
+      :name,
+      :gstin,
+      :place_of_supply,
+      :mobile,
+      :store_node_id,
+      :client_id,
+      :node_id
+    ])
     |> update_change(:gstin, &normalise_gstin/1)
     |> validate_required([:name, :store_node_id])
     |> validate_length(:name, max: 160)
     |> validate_length(:place_of_supply, max: 80)
     |> validate_length(:mobile, max: 20)
     |> validate_format(:gstin, @gstin_format, message: "is not a valid GSTIN")
+    |> unique_constraint([:node_id, :client_id])
   end
 
   defp normalise_gstin(nil), do: nil

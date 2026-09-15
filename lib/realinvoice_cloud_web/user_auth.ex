@@ -231,6 +231,28 @@ defmodule RealinvoiceCloudWeb.UserAuth do
     end
   end
 
+  def on_mount(:require_owner, _params, session, socket) do
+    socket = mount_current_scope(socket, session)
+    user = socket.assigns.current_scope && socket.assigns.current_scope.user
+
+    cond do
+      is_nil(user) ->
+        {:halt,
+         socket
+         |> Phoenix.LiveView.put_flash(:error, "You must log in to access this page.")
+         |> Phoenix.LiveView.redirect(to: ~p"/users/log-in")}
+
+      user.role == "owner" ->
+        {:cont, socket}
+
+      true ->
+        {:halt,
+         socket
+         |> Phoenix.LiveView.put_flash(:error, "Only an owner can manage billing desks.")
+         |> Phoenix.LiveView.redirect(to: ~p"/settings")}
+    end
+  end
+
   def on_mount(:require_sudo_mode, _params, session, socket) do
     socket = mount_current_scope(socket, session)
 

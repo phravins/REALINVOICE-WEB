@@ -77,8 +77,9 @@ defmodule SampleBilling do
     customers = insert_customers()
     items = insert_items()
     invoices = insert_invoices(customers, items)
+    credit_notes = insert_credit_notes(invoices)
 
-    {customers, items, invoices}
+    {customers, items, invoices, credit_notes}
   end
 
   defp insert_customers do
@@ -239,6 +240,105 @@ defmodule SampleBilling do
     invoice
   end
 
+  # A few corrections, because real trading has them: a returned item here, a
+  # wrong quantity there. Two are dated today so the dashboard's "revenue
+  # today" is visibly net of them, and one sits earlier in the month so the
+  # month-to-date figure differs from the day's.
+  #
+  # A credit note is dated when it is raised, not when the invoice was — so an
+  # older invoice corrected today reduces today's takings, not that day's.
+  @credit_reasons %{
+    0 => "One unit returned unopened",
+    1 => "Billed at the wrong rate, difference credited",
+    2 => "Damaged in transit, replaced free of charge"
+  }
+
+  defp insert_credit_notes(invoices) do
+    today = Date.utc_today()
+
+    # The latest invoice at each desk, corrected today, plus the earliest
+    # POS-01 invoice corrected a few days after it was raised.
+    latest_per_node =
+      @nodes
+      |> Enum.map(fn node ->
+        invoices
+        |> Enum.filter(&(&1.store_node_id == node))
+        |> List.last()
+      end)
+      |> Enum.reject(&is_nil/1)
+      |> Enum.map(&{&1, today})
+
+    earlier =
+      case Enum.filter(invoices, &(&1.store_node_id == "POS-01")) do
+        [first | _] -> [{first, earliest_credit_date(first.date, today)}]
+        [] -> []
+      end
+
+    (earlier ++ latest_per_node)
+    |> Enum.with_index()
+    |> Enum.reduce({[], Map.new(@nodes, &{&1, 0})}, fn {{invoice, date}, index},
+                                                       {acc, counters} ->
+      seq = Map.fetch!(counters, invoice.store_node_id) + 1
+      note = insert_credit_note(invoice, date, seq, index)
+      {[note | acc], Map.put(counters, invoice.store_node_id, seq)}
+    end)
+    |> elem(0)
+    |> Enum.reverse()
+  end
+
+  # Two days after the invoice, or today if that would be in the future.
+  defp earliest_credit_date(invoice_date, today) do
+    candidate = Date.add(invoice_date, 2)
+    if Date.compare(candidate, today) == :gt, do: today, else: candidate
+  end
+
+  defp insert_credit_note(invoice, date, seq, index) do
+    node = invoice.store_node_id
+
+    # Credit one unit of the invoice's first line — a returned item, not a
+    # cancelled invoice. Figures are stored positive: the document subtracts.
+    line = hd(invoice.lines)
+
+    credited = %{
+      item_id: line.item_id,
+      qty: Decimal.new(1),
+      rate: line.rate,
+      tax_rate: line.tax_rate,
+      line_total: money(line.rate)
+    }
+
+    subtotal = credited.line_total
+    tax_total = line_tax(credited)
+
+    # The credit follows the invoice's own tax regime, so an inter-state sale
+    # is credited under IGST and an intra-state one under CGST + SGST.
+    {cgst, sgst, igst} =
+      if Decimal.gt?(invoice.igst, 0) do
+        {Decimal.new("0.00"), Decimal.new("0.00"), tax_total}
+      else
+        half = tax_total |> Decimal.div(2) |> money()
+        {half, Decimal.sub(tax_total, half), Decimal.new("0.00")}
+      end
+
+    {:ok, note} =
+      Billing.create_credit_note(%{
+        credit_note_no: "CN-2026-" <> String.pad_leading(to_string(seq), 4, "0"),
+        date: date,
+        original_invoice_id: invoice.id,
+        reason: Map.fetch!(@credit_reasons, rem(index, map_size(@credit_reasons))),
+        subtotal: subtotal,
+        cgst: cgst,
+        sgst: sgst,
+        igst: igst,
+        grand_total: Decimal.add(subtotal, tax_total),
+        store_node_id: node,
+        created_by: Enum.random(Map.fetch!(@cashiers, node)),
+        lines: [credited]
+      })
+
+    note
+  end
+
   defp build_line(item) do
     qty = Decimal.new(Enum.random(1..4))
 
@@ -286,24 +386,19 @@ end
 
 reseed? = System.get_env("RESEED") in ~w(1 true yes)
 
+summary = fn {customers, items, invoices, credit_notes} ->
+  "#{length(customers)} customers, #{length(items)} items, " <>
+    "#{length(invoices)} invoices, #{length(credit_notes)} credit notes"
+end
+
 cond do
   reseed? ->
     Billing.delete_all_billing_data!()
-    {customers, items, invoices} = SampleBilling.run()
-
-    IO.puts(
-      "Rebuilt sample billing data: #{length(customers)} customers, " <>
-        "#{length(items)} items, #{length(invoices)} invoices"
-    )
+    IO.puts("Rebuilt sample billing data: " <> summary.(SampleBilling.run()))
 
   Billing.any_invoices?() ->
     IO.puts("Sample billing data already present, leaving it untouched (RESEED=1 to rebuild)")
 
   true ->
-    {customers, items, invoices} = SampleBilling.run()
-
-    IO.puts(
-      "Created sample billing data: #{length(customers)} customers, " <>
-        "#{length(items)} items, #{length(invoices)} invoices"
-    )
+    IO.puts("Created sample billing data: " <> summary.(SampleBilling.run()))
 end

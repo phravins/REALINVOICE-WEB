@@ -212,8 +212,10 @@ defmodule RealinvoiceCloud.BillingTest do
       Billing.subscribe()
       invoice = invoice_fixture()
 
-      assert_receive {:invoice_created, %Invoice{} = broadcast}
-      assert broadcast.id == invoice.id
+      # Pinned to this invoice: the topic is shared, so a concurrently running
+      # test's invoice may be sitting in the mailbox ahead of ours.
+      id = invoice.id
+      assert_receive {:invoice_created, %Invoice{id: ^id} = broadcast}
       # Broadcast invoices arrive ready to render, associations and all.
       assert [%InvoiceLine{item: %Item{}}] = broadcast.lines
     end

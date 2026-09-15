@@ -16,6 +16,8 @@ defmodule RealinvoiceCloud.Billing.Item do
     field :tax_rate, :decimal
     field :uom, :string
     field :store_node_id, :string
+    belongs_to :node, RealinvoiceCloud.Nodes.Node
+    field :client_id, :string
 
     timestamps(type: :utc_datetime)
   end
@@ -28,7 +30,16 @@ defmodule RealinvoiceCloud.Billing.Item do
   """
   def changeset(item, attrs) do
     item
-    |> cast(attrs, [:item_code, :description, :rate, :tax_rate, :uom, :store_node_id])
+    |> cast(attrs, [
+      :item_code,
+      :description,
+      :rate,
+      :tax_rate,
+      :uom,
+      :store_node_id,
+      :client_id,
+      :node_id
+    ])
     |> validate_required([:item_code, :rate, :tax_rate, :store_node_id])
     |> validate_length(:item_code, max: 60)
     |> validate_length(:description, max: 255)
@@ -38,5 +49,6 @@ defmodule RealinvoiceCloud.Billing.Item do
     |> unique_constraint([:store_node_id, :item_code],
       message: "already exists on this billing desk"
     )
+    |> unique_constraint([:node_id, :client_id])
   end
 end

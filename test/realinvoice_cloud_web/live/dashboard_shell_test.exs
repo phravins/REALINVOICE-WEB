@@ -4,12 +4,13 @@ defmodule RealinvoiceCloudWeb.DashboardShellTest do
   import Phoenix.LiveViewTest
   import RealinvoiceCloud.AccountsFixtures
 
+  # Nodes is owner-only, so it is not part of the sections every signed-in user
+  # sees; RealinvoiceCloudWeb.NodeLiveTest covers it.
   @sections [
     {"/", "Dashboard"},
     {"/invoices", "Invoices"},
     {"/customers", "Customers"},
     {"/items", "Items"},
-    {"/nodes", "Nodes"},
     {"/settings", "Settings"}
   ]
 
@@ -44,11 +45,25 @@ defmodule RealinvoiceCloudWeb.DashboardShellTest do
       assert html =~ "once your billing desks start syncing"
     end
 
-    test "Nodes is still a placeholder", %{conn: conn} do
-      {:ok, _lv, html} = live(conn, ~p"/nodes")
+    test "Nodes is hidden from a staff user's sidebar", %{conn: conn} do
+      {:ok, _lv, html} = live(conn, ~p"/")
 
-      assert html =~ "Coming soon"
-      assert html =~ "Nodes arrives once the desktop app starts syncing."
+      refute html =~ ~s(href="/nodes")
+    end
+
+    test "an owner sees Nodes in the sidebar", %{conn: conn} do
+      conn = log_in_user(conn, staff_user_fixture(%{role: "owner"}))
+
+      {:ok, _lv, html} = live(conn, ~p"/")
+
+      assert html =~ ~s(href="/nodes")
+    end
+
+    test "no section is a placeholder any more", %{conn: conn} do
+      for {path, _name} <- @sections do
+        {:ok, _lv, html} = live(conn, path)
+        refute html =~ "Coming soon"
+      end
     end
 
     test "the built sections render their own empty states", %{conn: conn} do

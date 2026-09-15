@@ -4,10 +4,8 @@ The web back office for RealInvoice. Billing desks running the RealInvoice
 desktop app sync their invoices, customers and items up here, where an
 administrator can see the whole business in one place.
 
-**Nothing syncs yet.** The data model, the reporting and the screens are built
-and backed by sample data, but there is no ingest API: the desks have no way to
-push anything up. That arrives once the desktop app has a sync worker and the
-payload shape it sends is settled.
+Desks push their data to `POST /api/sync/ingest`, authenticated with a per-desk
+API token issued from the back office; the screens update live as it arrives.
 
 ## Stack
 
@@ -54,7 +52,7 @@ Production reads `DATABASE_URL` and `SECRET_KEY_BASE` at runtime
 
 ## Data model
 
-Four tables mirror the desktop app's core data model, all under the
+Six tables mirror the desktop app's core data model, all under the
 `RealinvoiceCloud.Billing` context:
 
 | | |
@@ -63,6 +61,8 @@ Four tables mirror the desktop app's core data model, all under the
 | `items` | code, description, rate, tax rate, UOM |
 | `invoices` | number, date, customer, subtotal, CGST/SGST/IGST, grand total, payment type, `created_by` |
 | `invoice_lines` | item, quantity, rate, tax rate, line total |
+| `credit_notes` | number, date, original invoice, reason, subtotal, CGST/SGST/IGST, grand total, `created_by` |
+| `credit_note_lines` | item, quantity, rate, tax rate, line total |
 
 Every row carries a `store_node_id` — the billing desk it came from. Two things
 follow from that, and both are enforced by the schema:
@@ -87,18 +87,51 @@ invoices. Such an invoice shows as "Counter sale".
 cashier accounts, so it stores whatever the desk sends rather than resolving it
 to a user.
 
+### Credit notes
+
+A credit note corrects an invoice the desk has already issued. It is a separate
+document, not an edit: invoices stay append-only, and what an invoice is worth
+today is its grand total less the credit notes raised against it.
+
+Three decisions are worth knowing, because the rest of the app depends on them:
+
+  * **Its figures are stored positive.** A credit note subtracts because of what
+    it is, not because its numbers are negative. Netting is subtraction at the
+    point of use (`Billing.net_total/1`), so nothing depends on the desk having
+    remembered to send a minus sign.
+  * **It counts on its own date, not the invoice's.** An invoice from the 1st
+    credited on the 14th reduces the 14th's takings. Dating it back would restate
+    a day that has already been reported on, which is exactly what a credit note
+    exists to avoid.
+  * **It must name an invoice this server holds.** `original_invoice_id` is
+    `NOT NULL` and ingest rejects a note whose invoice it cannot resolve. An
+    unlinked credit note would sit in the database quietly netting nothing off
+    anything, which is worse than a rejection the worker can retry.
+
+The list and detail queries carry the aggregates as virtual fields
+(`credit_note_count`, `credited_total`) via one left-joined subquery, so a page
+of invoices costs one query rather than one per row. `Billing.net_total/1`,
+`credited_total/1` and `credited?/1` read them.
+
+Where this shows up in the UI: a **Credits** column and an **Any / Corrected /
+Not corrected** filter on the Invoices list, a **Net after credits** line and the
+notes themselves on an invoice's page, and a Dashboard whose revenue figures are
+net, with "₹X billed less ₹Y credited" spelled out underneath so the netting is
+visible rather than silent.
+
 ### Live updates
 
-`Billing.create_invoice/1` broadcasts on `"billing:invoices"`, and the invoice
-list and dashboard subscribe. When ingest starts calling that function, new
-invoices will appear in an open browser without a refresh. Nothing broadcasts in
-production yet, so the path is covered by tests rather than in use.
+`Billing.create_invoice/1` and `create_credit_note/1` broadcast on
+`"billing:invoices"`, and the invoice list, invoice detail page and dashboard
+subscribe. Ingest calls those functions, so a synced invoice — or a credit note
+against an invoice already on screen — appears without a refresh.
 
 ## Sample data
 
-`mix run priv/repo/seeds.exs` creates 3 customers, 6 items and 13 invoices
-across two desks (`POS-01`, `POS-02`) and a spread of dates in the current
-month. It is deterministic — the same figures on every machine — and idempotent.
+`mix run priv/repo/seeds.exs` creates 3 customers, 6 items, 13 invoices and 3
+credit notes across two desks (`POS-01`, `POS-02`) and a spread of dates in the
+current month. Two of the credit notes are dated today, so the dashboard's
+"revenue today" is visibly net of them. It is deterministic — the same figures on every machine — and idempotent.
 To rebuild it from scratch:
 
 ```sh
@@ -107,6 +140,174 @@ RESEED=1 mix run priv/repo/seeds.exs
 
 That discards and regenerates the billing data only; staff accounts are left
 alone.
+
+## Sync API
+
+`POST /api/sync/ingest` is where a billing desk's sync worker pushes its data.
+
+Every request must present the token of a desk registered under **Settings →
+Nodes**. The token is hashed on the way in and looked up against active nodes
+only; anything that does not resolve to one is a `401`. There is no fallback and
+no way to sync without a token.
+
+What is still deferred: **multi-tenancy**. Every registered node belongs to the
+one account this server holds. The `nodes.tenant_id` column exists and is
+indexed, but nothing populates or filters on it, so a token is scoped to a desk
+and not yet to a tenant.
+
+### Request
+
+```
+POST /api/sync/ingest
+Authorization: Bearer <the desk's token>      (or: X-Api-Token: <token>)
+Content-Type: application/json
+```
+
+```json
+{
+  "rows": [
+    { "client_id": "c-9f2a", "type": "customer",
+      "data": { "name": "Vaanavil Systems Pvt Ltd", "gstin": "33AABCV1234M1Z7",
+                "place_of_supply": "Tamil Nadu", "mobile": "+91 98400 11223" } },
+
+    { "client_id": "i-41b7", "type": "item",
+      "data": { "item_code": "RK-42U-PRO", "description": "42U Server Rack Pro",
+                "rate": "48500.00", "tax_rate": "18.00", "uom": "Nos" } },
+
+    { "client_id": "v-77c1", "type": "invoice",
+      "data": { "invoice_no": "RI-2026-0001", "date": "2026-09-13",
+                "customer_client_id": "c-9f2a",
+                "subtotal": "48500.00", "cgst": "4365.00", "sgst": "4365.00",
+                "igst": "0.00", "grand_total": "57230.00",
+                "payment_type": "UPI", "created_by": "Anitha R (till-1)",
+                "lines": [ { "client_id": "l-1", "item_client_id": "i-41b7",
+                             "qty": "1", "rate": "48500.00", "tax_rate": "18.00",
+                             "line_total": "48500.00" } ] } },
+
+    { "client_id": "cn-3d90", "type": "credit_note",
+      "data": { "credit_note_no": "CN-2026-0001", "date": "2026-09-14",
+                "original_invoice_client_id": "v-77c1",
+                "reason": "Returned unopened",
+                "subtotal": "48500.00", "cgst": "4365.00", "sgst": "4365.00",
+                "igst": "0.00", "grand_total": "57230.00",
+                "created_by": "Anitha R (till-1)",
+                "lines": [ { "client_id": "cnl-1", "item_client_id": "i-41b7",
+                             "qty": "1", "rate": "48500.00", "tax_rate": "18.00",
+                             "line_total": "48500.00" } ] } }
+  ]
+}
+```
+
+  * `client_id` is the desk's own identifier for the row — any string, stable
+    forever, never reused. **This is what makes ingest idempotent**: a retried
+    batch finds what it already wrote instead of inserting it again.
+  * `type` is one of `customer`, `item`, `invoice`, `invoice_line`,
+    `credit_note`, `credit_note_line`.
+  * Invoices name their customer with `customer_client_id`, and lines name their
+    item with `item_client_id` — the desk's identifiers, which the server
+    translates to its own primary keys. A desk never sends this server's ids.
+  * Lines may be **nested** in the invoice's `lines` (above) or sent as their own
+    `invoice_line` rows carrying `"invoice_client_id": "v-77c1"`. Both work; send
+    whichever suits the worker. Credit note lines work the same way, nested or as
+    `credit_note_line` rows carrying `"credit_note_client_id": "cn-3d90"`.
+  * A credit note names the invoice it corrects with
+    `original_invoice_client_id` — the invoice may be in the same batch (as
+    above) or one this server already holds. A note whose invoice cannot be
+    resolved is rejected, never stored unlinked.
+  * Credit note figures are sent **positive**, exactly as the document reads. The
+    server subtracts them where it reports; it does not expect a minus sign.
+  * Rows may arrive in any order — the server processes customers and items
+    first, then invoices, then their lines, then credit notes and theirs.
+  * **The desk is whichever node's token authenticated the request.** There is no
+    `store_node_id` in the payload — it comes from the node's name. A desk cannot
+    claim to be another desk, and a `store_node_id` sent anyway is ignored (and
+    logged, since it means a misconfiguration).
+  * Money and quantities are strings, to survive the trip without a float
+    rounding them.
+
+### Response
+
+Always `200` with a result per row, in the order sent — a batch is never all-or-
+nothing, so the worker can tell exactly which rows to retry or report:
+
+```json
+{
+  "batch": { "store_node_id": "POS-01", "received": 3, "accepted": 2, "rejected": 1 },
+  "results": [
+    { "client_id": "c-9f2a", "type": "customer", "status": "accepted",
+      "action": "inserted", "id": 12 },
+    { "client_id": "v-77c1", "type": "invoice", "status": "accepted",
+      "action": "unchanged", "id": 7 },
+    { "client_id": "i-41b7", "type": "item", "status": "rejected",
+      "errors": { "rate": ["must be greater than or equal to 0"] } }
+  ]
+}
+```
+
+`action` is `inserted`, `updated` or `unchanged`. `unchanged` means the row was
+already here — a successful retry, not a failure.
+
+Other statuses: `401` when the token is missing, unknown, or belongs to a revoked
+node — one identical response for all three, so the endpoint cannot be used to
+probe which tokens exist. `422` when the batch itself cannot be read (`rows` not
+a list, more than 1000 rows).
+
+### Rules
+
+  * **Idempotent, per desk.** Re-sending a batch changes nothing and reports the
+    same ids. A row's identity is (node, `client_id`) — client ids are generated
+    by a desk and are only unique within it, so two desks may use the same id for
+    unrelated rows without colliding.
+  * **Invoices and credit notes are append-only.** Once stored, neither is ever
+    rewritten, whatever a later batch says — a re-sent one comes back
+    `unchanged`, so a retried credit note cannot be counted twice. A desk that
+    needs to correct an invoice issues a credit note; one that needs to correct a
+    credit note issues another document, it does not amend the one already sent.
+    Customers and items are upserted, last write wins.
+  * **A row fails on its own.** Each unit is its own transaction, so one invalid
+    row does not roll back the rest of the batch. An invoice and its lines are a
+    single unit, as are a credit note and its lines: all of it lands or none of
+    it does.
+
+### Trying it
+
+Register a desk under **Settings → Nodes**, copy the token it shows you, then:
+
+```sh
+curl -X POST http://localhost:4000/api/sync/ingest \
+  -H 'Authorization: Bearer rin_the-token-you-copied' \
+  -H 'Content-Type: application/json' \
+  -d @batch.json
+```
+
+An accepted invoice appears in the Invoices list and moves the Dashboard totals
+in any open browser immediately, with no refresh — `Billing.create_invoice/1`
+broadcasts on `"billing:invoices"` and both LiveViews subscribe.
+
+## Billing desks (nodes)
+
+A node is a billing desk allowed to sync. Owners register them under **Settings →
+Nodes**; staff accounts cannot see the page and the nav entry is hidden from them.
+
+Registering a node issues a token and **shows it exactly once**. The server keeps
+only its SHA-256, so there is no "show it again" — if the token is lost, register
+the desk again. Revoking a node flips its status and its token stops working on
+its very next request; the record and its history stay, and it can be reinstated
+with the same token.
+
+The list shows each desk's status and `last_seen_at`, which is updated on every
+successful ingest request — that is the signal a per-desk health display is built
+on.
+
+### Why SHA-256 rather than bcrypt
+
+Passwords get bcrypt because they are low-entropy and guessable, and the cost is
+the defence. A node token is 32 bytes straight from the CSPRNG, so there is
+nothing to guess. More practically, bcrypt salts every hash, so a bcrypt hash
+cannot be looked up — authenticating a request would mean running bcrypt against
+every active node in turn. SHA-256 makes it one indexed row read, which is what
+this application's own `Accounts.UserToken` already does for session and
+magic-link tokens.
 
 ## Accounts
 
@@ -129,6 +330,53 @@ migration.
 Back-office accounts are entirely separate from the cashier logins on each
 billing desk; the two never share credentials.
 
+### Sign-in rate limiting
+
+Failed password sign-ins are counted in `failed_login_attempts` over a sliding
+15-minute window, with two independent limits:
+
+| Scope | Limit | Stops |
+|---|---|---|
+| Email | 5 failures | working a password list against one known address |
+| IP | 20 failures | spraying one password across many addresses from one machine |
+
+Either limit refuses the attempt, and the check runs **before** the password is
+verified — a correct password offered while blocked is still turned away, which
+is the whole point. The login screen shows a distinct "Too many attempts"
+message saying roughly how long is left, rather than the usual invalid-
+credentials error.
+
+A successful sign-in clears that email's failures, but never the IP's — otherwise
+anyone holding one valid account could reset the per-IP limit between bursts.
+Failures are recorded for addresses with no account too, so being blocked reveals
+nothing about who has an account.
+
+Every lockout and every attempt made *while* blocked is logged at warning level
+under `[login-throttle]`, which is the signal worth alerting on: someone who has
+forgotten their password stops, a script does not. The table keeps 24 hours of
+history — longer than the counting window — so a run of lockouts can be read back
+afterwards.
+
+Limits are configurable:
+
+```elixir
+config :realinvoice_cloud, RealinvoiceCloud.Accounts.LoginThrottle,
+  max_failures_per_email: 5,
+  max_failures_per_ip: 20,
+  window_minutes: 15,
+  retention_hours: 24
+```
+
+> **Behind a proxy**, `conn.remote_ip` is the proxy's address and the per-IP limit
+> would fire for everyone at once. Such a deployment needs `RemoteIp` configured
+> with its *trusted* proxy ranges. `x-forwarded-for` is deliberately not read
+> here — it is caller-supplied, so trusting it blindly would let an attacker
+> defeat the per-IP limit with a header.
+
+The emailed sign-in link is not rate limited by this: it proves control of the
+mailbox rather than guessing a secret, and blocking it would lock out the person
+trying to recover. Throttling *requests* for those links is a separate job.
+
 Signed-in users can change their own email and password at `/users/settings`.
 Forgotten passwords are handled by the "email me a link" option on the login
 page, which signs you in so you can set a new one.
@@ -149,19 +397,27 @@ browser and defaults to the operating system setting.
 ## Layout of the code
 
 ```
-lib/realinvoice_cloud/accounts/        auth context, user schema and tokens
+lib/realinvoice_cloud/accounts/        auth context, user schema, tokens, login throttle
 lib/realinvoice_cloud/billing.ex       queries, filters, dashboard figures, PubSub
-lib/realinvoice_cloud/billing/         customer, item, invoice, invoice_line
+lib/realinvoice_cloud/billing/         customer, item, invoice, invoice_line,
+                                       credit_note, credit_note_line
+lib/realinvoice_cloud/sync.ex          batch ingest: idempotency, per-row results
+lib/realinvoice_cloud/nodes.ex         registering desks, authenticating tokens
+lib/realinvoice_cloud/nodes/           the node schema
 lib/realinvoice_cloud_web/components/
   layouts.ex                           app shell (sidebar + top bar) and auth shell
   core_components.ex                   only what SaladUI does not cover
   ../format.ex                         money, quantity and date formatting
+lib/realinvoice_cloud_web/controllers/
+  sync_ingest_controller.ex            POST /api/sync/ingest
+lib/realinvoice_cloud_web/plugs/
+  require_sync_token.ex                resolves a token to an active node
 lib/realinvoice_cloud_web/live/
-  dashboard_live.ex                    today's revenue, counts, revenue by desk
+  dashboard_live.ex                    revenue net of credits, counts, revenue by desk
   invoice_live/                        invoice list (filters, live updates) and detail
   customer_live/                       customer list
   item_live/                           catalogue list
-  section_live.ex                      the Nodes placeholder
+  node_live/                           registering and revoking billing desks
   settings_live.ex                     Settings → Account
   user_live/                           login, confirmation, email & password
 priv/repo/seeds.exs                    owner account and sample billing data

@@ -12,7 +12,7 @@ defmodule RealinvoiceCloudWeb.InvoiceLive.Index do
 
   alias RealinvoiceCloud.Billing
 
-  @filter_keys ~w(from to node q)
+  @filter_keys ~w(from to node q credited)
 
   @impl true
   def mount(_params, _session, socket) do
@@ -36,6 +36,7 @@ defmodule RealinvoiceCloudWeb.InvoiceLive.Index do
      |> assign(:filtered?, filters != %{} and Enum.any?(filters, fn {_k, v} -> v != "" end))
      |> assign(:count, length(invoices))
      |> assign(:total, sum_grand_total(invoices))
+     |> assign(:credited_total, sum_credited(invoices))
      |> stream(:invoices, invoices, reset: true)}
   end
 
@@ -54,7 +55,28 @@ defmodule RealinvoiceCloudWeb.InvoiceLive.Index do
     {:noreply, push_patch(socket, to: ~p"/invoices")}
   end
 
+  # A credit note changes an existing row's credit column and the net total, so
+  # the affected invoice is re-read and swapped in place.
   @impl true
+  def handle_info({:credit_note_created, note}, socket) do
+    invoice = Billing.get_invoice!(note.original_invoice_id)
+
+    if Billing.matches_filters?(invoice, socket.assigns.filters) do
+      {:noreply,
+       socket
+       |> stream_insert(:invoices, invoice)
+       |> assign(:credited_total, Decimal.add(socket.assigns.credited_total, note.grand_total))}
+    else
+      # It no longer belongs in this view (an "uncredited" filter, say), so drop
+      # it rather than leave a row that contradicts the filter.
+      {:noreply,
+       socket
+       |> stream_delete(:invoices, invoice)
+       |> assign(:count, max(socket.assigns.count - 1, 0))
+       |> assign(:total, Decimal.sub(socket.assigns.total, invoice.grand_total))}
+    end
+  end
+
   def handle_info({:invoice_created, invoice}, socket) do
     # Only surface it if it belongs in the view the user is actually looking at,
     # otherwise a filtered list would start showing rows that contradict its
@@ -75,6 +97,12 @@ defmodule RealinvoiceCloudWeb.InvoiceLive.Index do
     Enum.reduce(invoices, Decimal.new("0.00"), &Decimal.add(&2, &1.grand_total))
   end
 
+  defp sum_credited(invoices) do
+    Enum.reduce(invoices, Decimal.new("0.00"), fn invoice, acc ->
+      Decimal.add(acc, Billing.credited_total(invoice))
+    end)
+  end
+
   @impl true
   def render(assigns) do
     ~H"""
@@ -93,7 +121,13 @@ defmodule RealinvoiceCloudWeb.InvoiceLive.Index do
             {@count} {if @count == 1, do: "invoice", else: "invoices"}
           </p>
           <p class="text-muted-foreground">
-            Total <span class="font-medium text-foreground">{money(@total)}</span>
+            <span :if={Decimal.gt?(@credited_total, 0)}>
+              Billed {money(@total)} less {money(@credited_total)} credited ·
+            </span>
+            Net
+            <span class="font-medium text-foreground">
+              {money(Decimal.sub(@total, @credited_total))}
+            </span>
           </p>
         </div>
 
@@ -106,6 +140,7 @@ defmodule RealinvoiceCloudWeb.InvoiceLive.Index do
                 <.table_head>Customer</.table_head>
                 <.table_head>Node</.table_head>
                 <.table_head>Payment</.table_head>
+                <.table_head class="text-right">Credits</.table_head>
                 <.table_head class="text-right">Grand Total</.table_head>
               </.table_row>
             </.table_header>
@@ -132,8 +167,23 @@ defmodule RealinvoiceCloudWeb.InvoiceLive.Index do
                   <.badge variant="secondary">{invoice.store_node_id}</.badge>
                 </.table_cell>
                 <.table_cell>{invoice.payment_type}</.table_cell>
+                <.table_cell class="text-right whitespace-nowrap">
+                  <span :if={Billing.credited?(invoice)} class="text-muted-foreground">
+                    −{money(Billing.credited_total(invoice))}
+                    <span class="ml-1 text-xs">
+                      ({invoice.credit_note_count})
+                    </span>
+                  </span>
+                  <span :if={!Billing.credited?(invoice)} class="text-muted-foreground">—</span>
+                </.table_cell>
                 <.table_cell class="text-right font-medium whitespace-nowrap">
-                  {money(invoice.grand_total)}
+                  <span :if={!Billing.credited?(invoice)}>{money(invoice.grand_total)}</span>
+                  <span :if={Billing.credited?(invoice)}>
+                    {money(Billing.net_total(invoice))}
+                    <span class="block text-xs font-normal text-muted-foreground line-through">
+                      {money(invoice.grand_total)}
+                    </span>
+                  </span>
                 </.table_cell>
               </.table_row>
             </.table_body>
@@ -194,6 +244,23 @@ defmodule RealinvoiceCloudWeb.InvoiceLive.Index do
         <.select_input id="filter-node" name="node" value={@filters["node"]} prompt="All nodes">
           <option :for={node <- @nodes} value={node} selected={@filters["node"] == node}>
             {node}
+          </option>
+        </.select_input>
+      </div>
+
+      <div class="space-y-1.5">
+        <.label for="filter-credited">Credits</.label>
+        <.select_input
+          id="filter-credited"
+          name="credited"
+          value={@filters["credited"]}
+          prompt="Any"
+        >
+          <option value="credited" selected={@filters["credited"] == "credited"}>
+            Corrected
+          </option>
+          <option value="uncredited" selected={@filters["credited"] == "uncredited"}>
+            Not corrected
           </option>
         </.select_input>
       </div>

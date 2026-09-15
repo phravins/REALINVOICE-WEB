@@ -71,6 +71,15 @@ config :tailwind,
     env: %{"NODE_PATH" => [Path.expand("../deps", __DIR__), Mix.Project.build_path()]}
   ]
 
+# Staff login rate limiting. Two independent sliding-window limits; see
+# RealinvoiceCloud.Accounts.LoginThrottle for why these are rows in Postgres
+# rather than counters in memory.
+config :realinvoice_cloud, RealinvoiceCloud.Accounts.LoginThrottle,
+  max_failures_per_email: 5,
+  max_failures_per_ip: 20,
+  window_minutes: 15,
+  retention_hours: 24
+
 # Configure Elixir's Logger
 config :logger, :default_formatter,
   format: "$time $metadata[$level] $message\n",

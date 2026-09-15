@@ -2,7 +2,10 @@ defmodule RealinvoiceCloudWeb.UserSessionController do
   use RealinvoiceCloudWeb, :controller
 
   alias RealinvoiceCloud.Accounts
+  alias RealinvoiceCloud.Accounts.LoginThrottle
   alias RealinvoiceCloudWeb.UserAuth
+
+  require Logger
 
   def create(conn, %{"_action" => "confirmed"} = params) do
     create(conn, params, "User confirmed successfully.")
@@ -32,17 +35,49 @@ defmodule RealinvoiceCloudWeb.UserSessionController do
   # email + password login
   defp create(conn, %{"user" => user_params}, info) do
     %{"email" => email, "password" => password} = user_params
+    ip = peer_address(conn)
 
-    if user = Accounts.get_user_by_email_and_password(email, password) do
-      conn
-      |> put_flash(:info, info)
-      |> UserAuth.log_in_user(user, user_params)
-    else
-      # In order to prevent user enumeration attacks, don't disclose whether the email is registered.
-      conn
-      |> put_flash(:error, "Invalid email or password")
-      |> put_flash(:email, String.slice(email, 0, 160))
-      |> redirect(to: ~p"/users/log-in")
+    # Checked before the password, not after: a correct password offered while
+    # blocked has to be refused too, or the limit protects nothing.
+    case LoginThrottle.check(email, ip) do
+      {:blocked, block} ->
+        Logger.warning(
+          "[login-throttle] refused a sign-in for #{String.slice(email, 0, 160)} from #{ip} " <>
+            "(blocked by #{block.scope}, #{block.failures} failures, " <>
+            "#{block.retry_after_seconds}s remaining)"
+        )
+
+        conn
+        |> put_flash(:too_many_attempts, LoginThrottle.blocked_message(block))
+        |> put_flash(:email, String.slice(email, 0, 160))
+        |> redirect(to: ~p"/users/log-in")
+
+      :ok ->
+        if user = Accounts.get_user_by_email_and_password(email, password) do
+          LoginThrottle.clear_failures(email)
+
+          conn
+          |> put_flash(:info, info)
+          |> UserAuth.log_in_user(user, user_params)
+        else
+          LoginThrottle.record_failure(email, ip)
+
+          # In order to prevent user enumeration attacks, don't disclose whether the email is registered.
+          conn
+          |> put_flash(:error, "Invalid email or password")
+          |> put_flash(:email, String.slice(email, 0, 160))
+          |> redirect(to: ~p"/users/log-in")
+        end
+    end
+  end
+
+  # The peer address as Plug reports it. Behind a proxy this needs RemoteIp
+  # configured with trusted ranges — see LoginThrottle's docs on why
+  # x-forwarded-for is not read here.
+  defp peer_address(conn) do
+    case conn.remote_ip do
+      nil -> "unknown"
+      ip -> ip |> :inet.ntoa() |> to_string()
     end
   end
 

@@ -1,37 +1,32 @@
-defmodule RealinvoiceCloud.Billing.InvoiceLine do
+defmodule RealinvoiceCloud.Billing.CreditNoteLine do
   @moduledoc """
-  One line of an invoice.
+  One line of a credit note.
 
-  `rate` and `tax_rate` are copied onto the line rather than read from the item,
-  because they are what was actually charged: repricing an item later must not
-  retrospectively change an invoice that has already been issued.
-
-  `line_total` is the taxable value of the line (quantity × rate, before tax) —
-  see `RealinvoiceCloud.Billing.Invoice` for how the totals fit together.
+  Quantities are positive, the same as on an invoice: a credit note is a
+  document that *subtracts*, so the sign lives in what the document is, not in
+  its numbers. Storing negatives here as well would net the credit back out
+  again the moment anything summed it.
   """
   use Ecto.Schema
 
   import Ecto.Changeset
 
-  schema "invoice_lines" do
-    belongs_to :invoice, RealinvoiceCloud.Billing.Invoice
+  schema "credit_note_lines" do
+    belongs_to :credit_note, RealinvoiceCloud.Billing.CreditNote
     belongs_to :item, RealinvoiceCloud.Billing.Item
+    belongs_to :node, RealinvoiceCloud.Nodes.Node
 
     field :qty, :decimal
     field :rate, :decimal
     field :tax_rate, :decimal
     field :line_total, :decimal
-    belongs_to :node, RealinvoiceCloud.Nodes.Node
     field :client_id, :string
 
     timestamps(type: :utc_datetime)
   end
 
   @doc """
-  Validates an invoice line.
-
-  A line with a zero or negative quantity is not a line, so that is rejected
-  outright; a zero rate is allowed for a free or bundled item.
+  Validates a credit note line, on the same terms as an invoice line.
   """
   def changeset(line, attrs) do
     line

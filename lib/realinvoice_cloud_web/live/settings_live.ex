@@ -7,9 +7,18 @@ defmodule RealinvoiceCloudWeb.SettingsLive do
   """
   use RealinvoiceCloudWeb, :live_view
 
+  alias RealinvoiceCloud.Nodes
+
   @impl true
   def mount(_params, _session, socket) do
-    {:ok, assign(socket, :page_title, "Settings")}
+    nodes = Nodes.list_nodes()
+
+    {:ok,
+     socket
+     |> assign(:page_title, "Settings")
+     |> assign(:node_count, length(nodes))
+     |> assign(:active_node_count, Enum.count(nodes, &(&1.status == "active")))
+     |> assign(:owner?, socket.assigns.current_scope.user.role == "owner")}
   end
 
   @impl true
@@ -53,14 +62,27 @@ defmodule RealinvoiceCloudWeb.SettingsLive do
 
         <section>
           <.section_heading
-            title="Sync"
-            description="How billing desks connect to this account."
+            title="Nodes"
+            description="The billing desks allowed to sync into this account, and the tokens they use."
           />
 
-          <p class="text-sm leading-relaxed text-muted-foreground">
-            Nothing to configure yet. Desk enrolment and sync credentials arrive with the
-            ingest API, once the desktop app has a sync worker to talk to it.
-          </p>
+          <.detail_list>
+            <:row label="Registered desks">
+              {@node_count} {if @node_count == 1, do: "desk", else: "desks"}
+            </:row>
+            <:row label="Able to sync">
+              {@active_node_count} active
+            </:row>
+          </.detail_list>
+
+          <div class="mt-5">
+            <.link :if={@owner?} navigate={~p"/nodes"}>
+              <.button variant="outline" size="sm">Manage nodes</.button>
+            </.link>
+            <p :if={!@owner?} class="text-sm text-muted-foreground">
+              Only an owner can register or revoke a billing desk.
+            </p>
+          </div>
         </section>
       </div>
     </Layouts.app>

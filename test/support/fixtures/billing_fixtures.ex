@@ -91,4 +91,59 @@ defmodule RealinvoiceCloud.BillingFixtures do
     {:ok, invoice} = Billing.create_invoice(Map.merge(defaults, attrs))
     invoice
   end
+
+  @doc """
+  A credit note against an invoice, with a single line.
+
+  Pass `:original_invoice_id`, or let it raise one against a fresh invoice.
+  """
+  def credit_note_fixture(attrs \\ %{}) do
+    attrs = Map.new(attrs)
+
+    invoice =
+      case Map.get(attrs, :original_invoice_id) do
+        nil -> invoice_fixture(%{store_node_id: Map.get(attrs, :store_node_id, "POS-01")})
+        id -> Billing.get_invoice!(id)
+      end
+
+    node = Map.get(attrs, :store_node_id, invoice.store_node_id)
+
+    lines =
+      Map.get_lazy(attrs, :lines, fn ->
+        item = item_fixture(%{store_node_id: node})
+
+        [
+          %{
+            item_id: item.id,
+            qty: "1",
+            rate: item.rate,
+            tax_rate: item.tax_rate,
+            line_total: item.rate
+          }
+        ]
+      end)
+
+    subtotal =
+      Enum.reduce(lines, Decimal.new("0.00"), fn line, acc ->
+        Decimal.add(acc, Decimal.new(to_string(line.line_total)))
+      end)
+
+    defaults = %{
+      credit_note_no: "CN-2026-#{System.unique_integer([:positive])}",
+      date: Date.utc_today(),
+      original_invoice_id: invoice.id,
+      reason: "Damaged on delivery",
+      subtotal: subtotal,
+      cgst: "0.00",
+      sgst: "0.00",
+      igst: "0.00",
+      grand_total: subtotal,
+      store_node_id: node,
+      created_by: "Anitha R (till-1)",
+      lines: lines
+    }
+
+    {:ok, credit_note} = Billing.create_credit_note(Map.merge(defaults, attrs))
+    credit_note
+  end
 end

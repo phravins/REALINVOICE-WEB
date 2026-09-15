@@ -2,9 +2,9 @@ defmodule RealinvoiceCloudWeb.DashboardLive do
   @moduledoc """
   The back office landing page: today's trading across every billing desk.
 
-  The figures come straight from the invoices the desks have sent up. Until the
-  ingest API exists that means the sample data in `priv/repo/seeds.exs`, so an
-  empty database still falls back to the "nothing has synced yet" state.
+  Revenue here is **net of credit notes** — what the business kept, not what it
+  billed. The gross figure and what was credited are shown alongside whenever
+  anything has been credited, so the netting is visible rather than silent.
   """
   use RealinvoiceCloudWeb, :live_view
 
@@ -23,6 +23,11 @@ defmodule RealinvoiceCloudWeb.DashboardLive do
 
   @impl true
   def handle_info({:invoice_created, _invoice}, socket) do
+    {:noreply, load_metrics(socket)}
+  end
+
+  # A credit note moves every figure on this page too.
+  def handle_info({:credit_note_created, _credit_note}, socket) do
     {:noreply, load_metrics(socket)}
   end
 
@@ -56,7 +61,7 @@ defmodule RealinvoiceCloudWeb.DashboardLive do
           <.stat_card
             label="Revenue today"
             value={money(@metrics.today.revenue)}
-            hint={"across #{@metrics.today.count} #{pluralise(@metrics.today.count, "invoice")}"}
+            hint={revenue_hint(@metrics.today)}
           />
           <.stat_card
             label="Invoices today"
@@ -66,7 +71,7 @@ defmodule RealinvoiceCloudWeb.DashboardLive do
           <.stat_card
             label="Revenue this month"
             value={money(@metrics.month.revenue)}
-            hint={"across #{@metrics.month.count} #{pluralise(@metrics.month.count, "invoice")}"}
+            hint={revenue_hint(@metrics.month)}
           />
           <.stat_card
             label="Busiest desk today"
@@ -90,12 +95,15 @@ defmodule RealinvoiceCloudWeb.DashboardLive do
                   <span class="ml-2">
                     {row.count} {pluralise(row.count, "invoice")}
                   </span>
+                  <span :if={credited?(row)} class="ml-2">
+                    less {money(row.credited)} credited
+                  </span>
                 </span>
               </div>
               <div class="h-2 w-full overflow-hidden rounded-full bg-muted">
                 <div
                   class="h-full rounded-full bg-primary"
-                  style={"width: #{share_of_total(row.revenue, @metrics.today.revenue)}%"}
+                  style={"width: #{share_of_total(row.revenue, @metrics.today.gross_revenue)}%"}
                 />
               </div>
             </div>
@@ -158,6 +166,21 @@ defmodule RealinvoiceCloudWeb.DashboardLive do
   defp pluralise(1, word), do: word
   defp pluralise(_count, word), do: word <> "s"
 
+  defp credited?(%{credited: credited}), do: Decimal.gt?(credited, 0)
+
+  # Only mentions credits when there are some — an untouched day should not be
+  # cluttered with "less ₹0.00 credited".
+  defp revenue_hint(totals) do
+    base = "across #{totals.count} #{pluralise(totals.count, "invoice")}"
+
+    if credited?(totals) do
+      base <>
+        " · #{money(totals.gross_revenue)} billed less #{money(totals.credited)} credited"
+    else
+      base
+    end
+  end
+
   # Bar width as a percentage of the day's takings. Guards against a zero total,
   # which would otherwise be a division by zero on a day with no sales.
   defp share_of_total(_revenue, total) when total in [nil, 0], do: 0
@@ -166,10 +189,13 @@ defmodule RealinvoiceCloudWeb.DashboardLive do
     if Decimal.eq?(total, 0) do
       0
     else
+      # Clamped: a desk that credited more than it billed has negative net
+      # revenue, and a negative width is not a bar.
       revenue
       |> Decimal.div(total)
       |> Decimal.mult(100)
       |> Decimal.round(1)
+      |> Decimal.max(Decimal.new(0))
       |> Decimal.to_string(:normal)
     end
   end
